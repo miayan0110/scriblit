@@ -5,6 +5,7 @@
 dataset/blip2/*
 dataset/iid/*
 scribblelight_controlnet/*
+*.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
