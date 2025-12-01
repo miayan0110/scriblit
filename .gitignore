@@ -1,3 +1,11 @@
+*.png
+*.jpg
+*.json
+*.pyc
+dataset/blip2/*
+dataset/iid/*
+scribblelight_controlnet/*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
