@@ -572,17 +572,35 @@ class PhysicalRelightingConfig:
         self.center_bias = 0.0
 
         # 輸出檔名
-        self.out_light = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_lightmap_{id}.png'
-        self.out_relit = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_relit_{id}.png'
+        self.out_light = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/gpt_test_lightmap_{id}.png'
+        self.out_relit = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/gpt_test_relit_{id}.png'
+
+
+    # ---- convenience helpers ----
+    def set_env(self, ambient: float):
+        """設定環境光（ambient）。要模擬關燈，設為 0.0。"""
+        self.ambient = float(ambient)
+
+    def set_off(self):
+        """快速切到「全暗」設定：ambient=0 且建議關閉 clamp（避免燈具區域漏光）。"""
+        self.ambient = 0.0
+        self.no_clamp = True
+
+    def set_on_defaults(self, ambient: float = 0.05):
+        """快速切到「開燈/有環境光」常用設定。"""
+        self.ambient = float(ambient)
+        self.no_clamp = False
 
     def add_mask(self, path_or_img, color=(1.0,1.0,1.0), gain=1.0):
-        """模仿 argparse 的 --mask path_or_img:r,g,b@gain"""
-        self.mask.append((path_or_img, color, gain))
-        if gain == 0.0:
-            self.ambient = 0.25  # 若有純色光，關掉 ambient
+        """加入一個面光源（由 mask 定義 emitter 區域）。
+
+        重要：這裡**不再**偷偷改動 ambient。要模擬「全暗→開燈」，請在外部明確設定：
+            phys_cfg.ambient = 0.0
+        """
+        self.mask.append((path_or_img, color, float(gain)))
 
 
-def compute_relighting(phys_cfg: PhysicalRelightingConfig, manual_ambient: Optional[float] = None):
+def compute_relighting(phys_cfg: PhysicalRelightingConfig):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # print('Device:', device)
 
@@ -595,12 +613,16 @@ def compute_relighting(phys_cfg: PhysicalRelightingConfig, manual_ambient: Optio
     light_rgb = torch.zeros((3,Hf,Wf), device=device)
 
     for (mask_path, color, gain) in phys_cfg.mask:
+        # gain<=0 時視為關燈：不計算光照，避免 clamp_inside 造成燈具區域漏光
+        if gain <= 0.0:
+            continue
+
         I = compute_lightmap_from_mask_torch(
             phys_cfg.normal, phys_cfg.depth, mask_path,
             scale=phys_cfg.scale, nsamples=phys_cfg.nsamples, nsteps=phys_cfg.nsteps,
             light_height_z=phys_cfg.height, intensity=phys_cfg.intensity,
             falloff=phys_cfg.falloff, with_shadows=phys_cfg.with_shadows,
-            clamp_inside=(not phys_cfg.no_clamp), percentile=phys_cfg.percentile,
+            clamp_inside=((not phys_cfg.no_clamp) and (gain > 0.0)), percentile=phys_cfg.percentile,
             device=device, auto_emission=phys_cfg.auto_emission,
             n_dirs=phys_cfg.emit_dirs, radius_px=phys_cfg.emit_radius, step_px=phys_cfg.emit_step,
             down_bias=phys_cfg.emit_down_bias, mix_wall_normal=phys_cfg.emit_mix_normal,
@@ -614,7 +636,7 @@ def compute_relighting(phys_cfg: PhysicalRelightingConfig, manual_ambient: Optio
         c = torch.tensor(color, device=device).view(3,1,1)
         light_rgb += (I * gain).expand(3,-1,-1) * c
 
-    light_rgb = light_rgb.clamp(0,1)
+    # 不要太早 clamp light_rgb，讓強光能保留（最後由 composite/tone mapping 控制輸出）
     light_gray = light_rgb.max(dim=0, keepdim=True).values  # 方便存灰階 lightmap
 
     # composite
@@ -630,10 +652,7 @@ def compute_relighting(phys_cfg: PhysicalRelightingConfig, manual_ambient: Optio
     # return images instead of saving
     lightmap = tensor_gray_to_pil(light_gray)  # 灰階光圖
     i_relit = tensor_to_pil(relit)            # 彩色 relit 結果
-    return {
-        "image": i_relit,
-        "lightmap": lightmap
-    }
+    return i_relit, lightmap
 
 
 def relight_with_ichange(
@@ -681,21 +700,21 @@ def relight_with_ichange(
     return relit_img
 
 
-# if __name__ == '__main__':
-#     # ds: DS = load_from_disk('/mnt/HDD3/miayan/paper/relighting_datasets/lightlab_eval_alb')
-#     ds: DS = load_dataset("Miayan/physical-relighting-dataset", split="train", cache_dir='/mnt/HDD3/miayan/paper/relighting_datasets/')
-#     for c in ds.column_names:
-#         if c not in ('color', 'intensity', 'prompt'):
-#             ds = ds.cast_column(c, HfImage(decode=True))
+if __name__ == '__main__':
+    # ds: DS = load_from_disk('/mnt/HDD3/miayan/paper/relighting_datasets/lightlab_eval_alb')
+    ds: DS = load_dataset("Miayan/physical-relighting-dataset", split="train", cache_dir='/mnt/HDD3/miayan/paper/relighting_datasets/')
+    for c in ds.column_names:
+        if c not in ('color', 'intensity', 'prompt'):
+            ds = ds.cast_column(c, HfImage(decode=True))
 
-#     id = 24
-#     ori = ds[id]['image']
-#     normal = ds[id]['normal']
-#     depth = ds[id]['depth']
-#     phys_cfg = PhysicalRelightingConfig(ori=ori, normal=normal, depth=depth, id=id)
-#     phys_cfg.add_mask(ds[id]['mask'], (1,0,0), 1)
-#     # phys_cfg.add_mask(f'/mnt/HDD3/miayan/paper/scriblit/eval_data/images_flatten/mask/1.png', (1,0,0), 1)
-#     phys, lightmap = compute_relighting(phys_cfg)
-#     phys.save(phys_cfg.out_relit)
-#     lightmap.save(phys_cfg.out_light)
-#     ori.save(f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_ori_{id}.png')
+    id = 24
+    ori = ds[id]['image']
+    normal = ds[id]['normal']
+    depth = ds[id]['depth']
+    phys_cfg = PhysicalRelightingConfig(ori=ori, normal=normal, depth=depth, id=id)
+    phys_cfg.add_mask(ds[id]['mask'], (1,0,0), 0)
+    # phys_cfg.add_mask(f'/mnt/HDD3/miayan/paper/scriblit/eval_data/images_flatten/mask/1.png', (1,0,0), 1)
+    phys, lightmap = compute_relighting(phys_cfg)
+    phys.save(phys_cfg.out_relit)
+    lightmap.save(phys_cfg.out_light)
+    ori.save(f'/mnt/HDD3/miayan/paper/scriblit/eval_data/gpt_test_ori_{id}.png')

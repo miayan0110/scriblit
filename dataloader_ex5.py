@@ -6,13 +6,14 @@ import random
 from PIL import Image, ImageFilter
 import numpy as np
 
-from datasets import load_from_disk, Image as HfImage, Dataset as DS
+from datasets import load_from_disk, Image as HfImage, Dataset as DS, load_dataset
 from physical_relighting_api_v2 import compute_relighting, PhysicalRelightingConfig
 
 class Indoor_dataset(Dataset):
 	def __init__(self, tokenizer, ds_path):
 		self.tokenizer = tokenizer
-		self.ds: DS = load_from_disk(ds_path)
+		# self.ds: DS = load_from_disk(ds_path)
+		self.ds: DS = load_dataset("Miayan/physical-relighting-dataset", split="test", cache_dir=ds_path)
 		print(self.ds)
 		for col in self.ds.column_names:
 			if col not in ('color', 'intensity', 'prompt'):
@@ -44,6 +45,7 @@ class Indoor_dataset(Dataset):
 		self.colors = self.colors / 255.0
   
 		self.intensity = torch.tensor([0.0, 0.1, 0.2, 0.4, 0.7, 1.0], dtype=torch.float32)
+		# self.intensity = torch.tensor([0.0, 1.0], dtype=torch.float32)
 		
 	def __len__(self):
 		return len(self.ds)

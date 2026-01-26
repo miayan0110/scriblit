@@ -81,11 +81,11 @@ def to_jpeg_256(pil_img, quality=90):
 def encode_all(ex, quality=90):
     out = {}
     out["image"]      = to_jpeg_256(pil_from_any(ex["image"]), quality)
-    out["mask"]       = to_jpeg_256(pil_from_any(ex["mask"]), quality)
+    # out["mask"]       = to_jpeg_256(pil_from_any(ex["mask"]), quality)
     out["normal"]     = to_jpeg_256(pil_from_any(ex["normal"]), quality)
     out["depth"]      = to_jpeg_256(pil_from_any(ex["depth"]), quality)
-    out["pseudo_gt"]  = to_jpeg_256(pil_from_any(ex["pseudo_gt"]), quality)
-    out["lightmap"]   = to_jpeg_256(pil_from_any(ex["lightmap"]), quality)
+    # out["pseudo_gt"]  = to_jpeg_256(pil_from_any(ex["pseudo_gt"]), quality)
+    # out["lightmap"]   = to_jpeg_256(pil_from_any(ex["lightmap"]), quality)
     out["albedo"]     = to_jpeg_256(pil_from_any(ex["albedo"]), quality)
     return out
 
@@ -96,7 +96,6 @@ def gen_alb(ex, intrinsic_model, device):
 
     # 關鍵「小改」：轉成 float32 並縮放到 0~1，避免下游變成 float64
     np_rgb = np_rgb.astype(np.float32) / 255.0
-    print(np_rgb.shape)
 
     result = run_pipeline(
         intrinsic_model,
@@ -115,54 +114,56 @@ def main(args):
     intrinsic_model = load_models('v2', device=device)
 
     ds = load_from_disk(args.src_image)
+    # ds = load_dataset("Miayan/physical-relighting-eval-dataset", split="train", cache_dir=args.src_image)
+    # ds = ds.select(range(4))
     print(ds)
     for col in ds.column_names:
         if col not in ('color', 'intensity'):
             ds = ds.cast_column(col, Image(decode=True))
 
-    gen_alb(ds[0], intrinsic_model=intrinsic_model, device=device)
+    # gen_alb(ds[0], intrinsic_model=intrinsic_model, device=device)
 
-    # # generate albedo
-    # ds = ds.map(
-    #     lambda ex: gen_alb(ex, intrinsic_model=intrinsic_model, device=device),
-    #     num_proc=args.num_proc,
-    #     batched=False,
-    #     writer_batch_size=1000,
-    #     desc="Generating albedo..."
-    # )
+    # generate albedo
+    ds = ds.map(
+        lambda ex: gen_alb(ex, intrinsic_model=intrinsic_model, device=device),
+        num_proc=args.num_proc,
+        batched=False,
+        writer_batch_size=1000,
+        desc="Generating albedo..."
+    )
 
-    # # 全部 resize + jpeg
-    # print("[INFO] resizing to 256x256 and encoding as JPEG...")
-    # ds = ds.map(
-    #     lambda ex: encode_all(ex, quality=args.quality),
-    #     num_proc=args.num_proc,
-    #     batched=False,
-    #     writer_batch_size=1000,
-    #     desc="Resize + JPEG encode"
-    # )
+    # 全部 resize + jpeg
+    print("[INFO] resizing to 256x256 and encoding as JPEG...")
+    ds = ds.map(
+        lambda ex: encode_all(ex, quality=args.quality),
+        num_proc=args.num_proc,
+        batched=False,
+        writer_batch_size=1000,
+        desc="Resize + JPEG encode"
+    )
     
-    # os.makedirs(args.out, exist_ok=True)
-    # ds.save_to_disk(args.out)
-    # print(f"[DONE] saved to {args.out}")
+    os.makedirs(args.out, exist_ok=True)
+    ds.save_to_disk(args.out)
+    print(f"[DONE] saved to {args.out}")
     
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src_image", default='/mnt/HDD7/miayan/paper/relighting_datasets/lsun_train_gt', help="原dataset路徑")
-    ap.add_argument("--out", default='/mnt/HDD7/miayan/paper/relighting_datasets/lsun_train', help="輸出 dataset 路徑")
+    ap.add_argument("--src_image", default='/mnt/HDD3/miayan/paper/relighting_datasets/lightlab_eval', help="原dataset路徑")
+    ap.add_argument("--out", default='/mnt/HDD3/miayan/paper/relighting_datasets/lightlab_eval_alb', help="輸出 dataset 路徑")
     ap.add_argument("--num_proc", type=int, default=1)
-    ap.add_argument("--device", default='cuda:4', help="gpu")
+    ap.add_argument("--device", default='cuda:0', help="gpu")
     ap.add_argument("--quality", type=int, default=90)  # 補上，給 encode_all 用
     args = ap.parse_args()
 
     main(args)
 
-    # ds = load_from_disk(args.out)
-    # print(ds)
-    # for col in ds.column_names:
-    #     if col not in ('color', 'intensity'):
-    #         ds = ds.cast_column(col, Image(decode=True))
+    ds = load_from_disk(args.out)
+    print(ds)
+    for col in ds.column_names:
+        if col not in ('color', 'intensity'):
+            ds = ds.cast_column(col, Image(decode=True))
     
-    # ds[0]['image'].save('image.jpg')
-    # ds[0]['pseudo_gt'].save('pseudo_gt.jpg')
-    # ds[0]['albedo'].save('albedo.jpg')
+    ds[0]['image'].save('/mnt/HDD3/miayan/paper/scriblit/eval_data/image.jpg')
+    # ds[0]['pseudo_gt'].save('/mnt/HDD3/miayan/paper/scriblit/eval_data/pseudo_gt.jpg')
+    ds[0]['albedo'].save('/mnt/HDD3/miayan/paper/scriblit/eval_data/albedo.jpg')

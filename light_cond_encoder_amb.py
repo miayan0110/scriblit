@@ -5,15 +5,16 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 class LightCondEncoder(nn.Module):
-    def __init__(self, cross_dim:int, n_tokens:int=4, fourier_B_intensity:int=4, fourier_B_color:int=4):
+    def __init__(self, cross_dim:int, n_tokens:int=4, fourier_B_intensity:int=4, fourier_B_color:int=4, fourier_B_ambient:int=4):
         super().__init__()
         self.K = n_tokens
         self.Bi = fourier_B_intensity
         self.Bc = fourier_B_color
+        self.Ba = fourier_B_ambient
         self.cross_dim = cross_dim
 
-        # 計算輸入維度：i(1) + c(3) + Fi + Fc + 交互項(i*c)
-        in_dim = 1 + 3 + (2*self.Bi*1) + (2*self.Bc*3) + 3
+        # 計算輸入維度：intensity(1) + ambient(1) + color(3) + Fi(2*Bi) + Fa(2*Ba) + Fc(2*Bc) + 交互項(i*c)(3)
+        in_dim = 1 + 1 + 3 + (2*self.Bi*1) + (2*self.Ba*1) + (2*self.Bc*3) + 3
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, 256), nn.SiLU(),
             nn.Linear(256, 256),    nn.SiLU(),
@@ -32,16 +33,18 @@ class LightCondEncoder(nn.Module):
         sin, cos = torch.sin(x).flatten(1), torch.cos(x).flatten(1)
         return torch.cat([sin, cos], dim=-1)  # (N, 2*D*B)
 
-    def forward(self, intensity: torch.Tensor, color: torch.Tensor) -> torch.Tensor:
+    def forward(self, intensity: torch.Tensor, ambient: torch.Tensor, color: torch.Tensor) -> torch.Tensor:
         """
         intensity: (N,1) in [0,1]
+        ambient:   (N,1) in [0,1]
         color:     (N,3) in [0,1]
         return:    (N, K, D)  --> 給 UNet/ControlNet 的 encoder_hidden_states
         """
         # 顏色只取方向（幅度交給 intensity）
         c = color / (color.norm(dim=-1, keepdim=True) + 1e-8)
-        feats = [intensity, c,
+        feats = [intensity, ambient, c,
                  self._fourier(intensity, self.Bi),
+                 self._fourier(ambient,   self.Ba),
                  self._fourier(c,         self.Bc),
                  intensity * c]                      # 交互項
         x = torch.cat([t for t in feats if t.numel() > 0], dim=-1)  # (N, in_dim)
@@ -50,13 +53,13 @@ class LightCondEncoder(nn.Module):
 
 class CustomEncoder(ModelMixin, ConfigMixin):
     @register_to_config
-    def __init__(self, cross_dim: int, K: int = 4, Bi: int = 6, Bc: int = 6):
+    def __init__(self, cross_dim: int, K: int = 4, Bi: int = 6, Bc: int = 6, Ba: int = 6):
         super().__init__()
-        self.enc = LightCondEncoder(cross_dim, K, Bi, Bc)
+        self.enc = LightCondEncoder(cross_dim, K, Bi, Bc, Ba)
         self.D = cross_dim
 
-    def forward(self, intensity, color, pad_to_77: bool = False):
-        cond = self.enc(intensity, color)  # (B, K, D)
+    def forward(self, intensity, ambient, color, pad_to_77: bool = False):
+        cond = self.enc(intensity, ambient, color)  # (B, K, D)
         if pad_to_77:
             B, K, D = cond.shape
             if K < 77:

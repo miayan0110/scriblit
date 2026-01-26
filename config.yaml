@@ -1,0 +1,149 @@
+experiment:
+  project_name: "relighting_indoors"
+  output_dir: "train_ex8_10"
+  logging_dir: "logs"
+  report_to: "tensorboard"
+
+model:
+  pretrained_model_name_or_path: "/mnt/HDD3/miayan/paper/envs/huggingface_cache/models--stabilityai--stable-diffusion-2-1/snapshots/5cae40e6a2745ae2b01ad92ae5043f95f23644d6"
+  revision: null
+  variant: null
+  tokenizer_name: null
+  # Custom params
+  hf_repo_id: "Miayan/project"
+  hf_version: null # e.g. "train_ex6" or null
+  pretrain_unet_path: "scribblelight_controlnet/checkpoint-10000"
+  resume_from_checkpoint: "latest" # or path
+  enable_ambient_cond: true # true: Intensity + Ambient + Color; false: Intensity + Color
+
+light_encoder:
+  cross_dim: 768 # SD1.5 dim
+  K: 4
+  Bi: 4
+  Bc: 4
+  Ba: 4
+
+albedo_estimator:
+  enabled: true
+  version: "v2" # 對應 pipeline load_models('v2')
+  load_stage: 3 # 只載入到 Stage 3
+
+  frozen_components:
+    - "ord_model"
+    - "iid_model"
+    - "col_model"
+
+  trainable_components:
+    - "alb_model"
+
+data:
+  dataset_cache_dir: "/mnt/HDD3/miayan/paper/relighting_datasets/" 
+  data_hf_repo_id: "Miayan/physical-relighting-dataset"
+  data_split: "test"
+  resolution: 512 
+  dataloader_num_workers: 0
+  condition_mode: "lightmap_normal" # "lightmap_normal" or "depth_mask_normal"
+
+  # 指定 Relighting API 實作版本
+  # "v2": 原始版 (Fixed ambient 0.75, Lightmap = Source only)
+  # "gemini": 隨機 Ambient 版 (Lightmap = Source only) -> 注意：原本的 code 沒回傳 ambient，若要用這個需改 code
+  # "gemini_amb": 隨機 Ambient 版 (Lightmap = Source + Ambient, 回傳 ambient scalar)
+  relighting_impl: "gemini_amb"
+
+  # === [新增] ControlNet 輸入選擇 ===
+  # true: 使用含 Ambient 的 Lightmap (灰底，對比低) -> 導致結果變淡
+  # false: 使用不含 Ambient 的 Lightmap (黑底，對比高) -> 推薦！影子較深
+  use_ambient_in_controlnet: true
+
+  colors:
+    - [255, 255, 255] # white
+    - [255, 0, 0]     # red
+    - [0, 255, 0]     # green
+    - [0, 0, 255]     # blue
+    - [255, 255, 0]   # yellow
+    - [255, 165, 0]   # orange
+    - [128, 0, 128]   # purple
+    - [255, 192, 203] # pink
+    - [0, 255, 255]   # cyan
+    - [255, 0, 255]   # magenta
+
+  intensities: [0.0, 0.1, 0.2, 0.4, 0.7, 1.0]
+
+training:
+  batch_size: 1 # 1/4
+  num_epochs: 20  # 20/60
+  max_train_steps: null
+  max_train_samples: null
+  seed: 42
+  mixed_precision: "no" # "no", "fp16", "bf16"
+  allow_tf32: true
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 5000
+  checkpoints_total_limit: 5
+
+  # Optimizer
+  learning_rate: 5.0e-6 # 5.0e-6/2.0e-5
+  scale_lr: false
+  lr_scheduler: "constant"
+  lr_warmup_steps: 500
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  use_8bit_adam: false
+  set_grads_to_none: false
+
+losses:
+  phys_loss:
+    enabled: true
+    weight: 1.0
+  latent_loss:
+    enabled: true
+    weight: 1.0
+  image_loss:
+    enabled: true
+    weight: 1.0
+  area_loss:
+    enabled: false
+    weight: 10.0
+  intensity_loss:
+    enabled: false
+    weight: 1.0
+  recon_loss:
+    enabled: false 
+    weight: 1.0
+    keep_aux_models_on_gpu: true
+
+  # === [新增] Albedo Estimator 專用 Losses ===
+  # 1. 結構監督 (Structure-only Supervision)
+  #    只比較灰階亮度，忽略顏色差異。
+  sup_structure_loss:
+    enabled: true
+    weight: 1.0
+    enable_decay: true      # 是否啟用權重衰減 (Curriculum Learning)
+    start_weight: 1.0       # 初始權重
+    end_weight: 0.1         # 最終權重 (訓練後期讓物理 Loss 主導)
+    decay_steps: 5000       # 在多少步內衰減完畢
+
+  # 2. 物理重建 Loss (Physics Self-Reconstruction)
+  #    Albedo * Light(RGB) = PseudoGT
+  self_recon_loss:
+    enabled: true
+    mode: "teacher"         # 選項: "original", "teacher", "staged"
+    weight: 2.0             # 通用權重
+    affine_alignment: true  # 加入 Bias & Scale
+    epsilon: 0.05
+    
+    # 僅在 mode == "staged" 時生效的參數
+    staging:
+      switch_epoch: 5       # 第幾個 epoch 切換模式
+      stage1_weight: 2.0    # 排毒階段權重 (灰階)
+      stage2_weight: 0.5    # 上色階段權重
+
+  # 3. 一致性 Loss (Consistency Loss)
+  #    Albedo(Ori) == Albedo(Relit)
+  #    [注意] 在 ControlNet 收斂前建議關閉 (false)，以免學到錯誤顏色
+  consistency_loss:
+    enabled: true
+    weight: 1.0

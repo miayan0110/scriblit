@@ -12,6 +12,10 @@ Mask-driven relighting (NORMAL + DEPTH) — PyTorch CUDA
   每個子光點各自取局部中心深度（更精準的面光源）。
 - 若系統有 SciPy，使用距離變換 EDT；否則使用純 PyTorch 近似（反覆侵蝕計數，L∞ 距離）
 
+【本次修改重點】：
+- Data Synthesis 專用邏輯：在 compute_relighting 中加入隨機環境光與假反彈 (Fake Bounce)。
+- 解決「全黑開燈」與「吊燈不亮」的物理不一致問題。
+
 pip install torch pillow numpy
 （可選）pip install scipy
 
@@ -22,6 +26,7 @@ from os import PathLike
 import io
 import math
 import numpy as np
+import random  # <--- [Added] 為了隨機採樣環境光
 from PIL import Image
 import torch
 from torch import nn
@@ -88,7 +93,7 @@ def as_pil(x, mode: Optional[str] = None) -> Image.Image:
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 1)
             arr = (arr * 255).astype(np.uint8)
-        img = Image.fromarray(arr)
+            img = Image.fromarray(arr)
 
     # 6) torch tensor
     elif isinstance(x, torch.Tensor):
@@ -551,7 +556,7 @@ class PhysicalRelightingConfig:
         self.percentile = 99.0
 
         # 環境光 / 合成
-        self.ambient = 0.75
+        self.ambient = 0.75 # [Note]: This value is now overridden in compute_relighting for random synthesis
         self.light_weight = 1.0
         self.max_gain = None
         self.tone = 'none'        # ['none','exposure']
@@ -572,17 +577,18 @@ class PhysicalRelightingConfig:
         self.center_bias = 0.0
 
         # 輸出檔名
-        self.out_light = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_lightmap_{id}.png'
-        self.out_relit = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_relit_{id}.png'
+        self.out_light = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/gemini_test_lightmap_{id}.png'
+        self.out_relit = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/gemini_test_relit_{id}.png'
 
     def add_mask(self, path_or_img, color=(1.0,1.0,1.0), gain=1.0):
         """模仿 argparse 的 --mask path_or_img:r,g,b@gain"""
         self.mask.append((path_or_img, color, gain))
-        if gain == 0.0:
-            self.ambient = 0.25  # 若有純色光，關掉 ambient
+        # [Modified]: 移除了原本的 self.ambient 修改邏輯，避免干擾隨機生成
+        # if gain == 0.0:
+        #     self.ambient = 0.25 
 
 
-def compute_relighting(phys_cfg: PhysicalRelightingConfig, manual_ambient: Optional[float] = None):
+def compute_relighting(phys_cfg: PhysicalRelightingConfig):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # print('Device:', device)
 
@@ -617,10 +623,41 @@ def compute_relighting(phys_cfg: PhysicalRelightingConfig, manual_ambient: Optio
     light_rgb = light_rgb.clamp(0,1)
     light_gray = light_rgb.max(dim=0, keepdim=True).values  # 方便存灰階 lightmap
 
+    # =========================================================================
+    # [Modified Start] Ambient Randomization Logic for Pseudo GT Generation
+    # =========================================================================
+    
+    # 1. 算出這張圖裡「燈光總能量」的平均值 (代表這盞燈有多亮、照亮了多少區域)
+    #    這會自動區分 "小夜燈" (mean很小) 和 "大吊燈" (mean很大)
+    min_ambient_floor = 0.2    # 設定最低環境光地板，避免訓練崩潰
+    mean_light_energy = light_rgb.mean().item() 
+    
+    # 2. 設定反彈係數 (Bounce Factor)
+    #    模擬不同房間材質的反光率 (0.1 ~ 0.3)
+    #    意思就是：燈光能量的 10%~30% 會變成環境光散布到整個房間
+    bounce_ratio = random.uniform(0.1, 0.3) 
+    bounce_ambient = mean_light_energy * bounce_ratio
+    
+    # 3. 設定基礎環境光 (Base Ambient) - 這部分維持隨機 (模擬時間)
+    #    隨機決定是白天(0.5+)還是晚上(0.0)
+    rand_time = random.random()
+    if rand_time < 0.3:
+        base_ambient = random.uniform(0.0, 0.1) # 模擬深夜
+    else:
+        base_ambient = random.uniform(0.1, 0.8) # 模擬日間/昏暗
+        
+    # 4. 最終環境光 = 隨機時間 + 燈光反彈
+    final_ambient = base_ambient + bounce_ambient
+    final_ambient = min(final_ambient, 1.0) # 確保不過曝
+
+    # =========================================================================
+    # [Modified End]
+    # =========================================================================
+
     # composite
     relit = composite_with_color(
         orig, light_rgb,
-        ambient=phys_cfg.ambient,
+        ambient=final_ambient, # <--- [Modified] 使用計算出的 final_ambient
         light_weight=phys_cfg.light_weight,
         max_gain=phys_cfg.max_gain,
         tone=phys_cfg.tone,
@@ -698,4 +735,4 @@ def relight_with_ichange(
 #     phys, lightmap = compute_relighting(phys_cfg)
 #     phys.save(phys_cfg.out_relit)
 #     lightmap.save(phys_cfg.out_light)
-#     ori.save(f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_ori_{id}.png')
+#     ori.save(f'/mnt/HDD3/miayan/paper/scriblit/eval_data/gemini_test_ori_{id}.png')

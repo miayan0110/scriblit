@@ -27,6 +27,7 @@ from PIL import Image
 import torch
 from torch import nn
 import torch.nn.functional as F
+from datasets import load_dataset, load_from_disk, Image as HfImage, Dataset as DS
 
 # ---------------------- utils ----------------------
 
@@ -379,9 +380,9 @@ class PhysicalRelightingConfig:
         self.emit_down_bias = 0.25
         self.emit_mix_normal = 0.35
 
-        # 輸出檔名
-        self.out_light = out_lightmap
-        self.out_relit = out_relit
+        # # 輸出檔名
+        # self.out_light = out_lightmap
+        # self.out_relit = out_relit
 
     def add_mask(self, path, color=(1.0,1.0,1.0), gain=1.0):
         """模仿 argparse 的 --mask path:r,g,b@gain"""
@@ -441,15 +442,17 @@ def compute_relighting(phys_cfg):
     # print('Saved:', phys_cfg.out_light, phys_cfg.out_relit)
 
 if __name__ == '__main__':
-    for i in range(4):
-        ori = f'/mnt/HDD7/miayan/paper/relighting_datasets/test_image_{i}.png'
-        normal = f'/mnt/HDD7/miayan/paper/relighting_datasets/test_normal_{i}.png'
-        depth = f'/mnt/HDD7/miayan/paper/relighting_datasets/test_depth_{i}.png'
-        out_lightmap = f'/mnt/HDD7/miayan/paper/relighting_datasets/test_lightmap_{i}.png'
-        out_relit = f'/mnt/HDD7/miayan/paper/relighting_datasets/test_relit_{i}.png'
+    ds: DS = load_from_disk('/mnt/HDD3/miayan/paper/relighting_datasets/lightlab_eval_alb')
+    
+    for i in range(1):
+        ori = ds[182+i]['image']
+        normal = ds[182+i]['normal']
+        depth = ds[182+i]['depth']
+        out_lightmap = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_lightmap_{182+i}.png'
+        out_relit = f'/mnt/HDD3/miayan/paper/scriblit/eval_data/test_relit_{182+i}.png'
         
         phys_cfg = PhysicalRelightingConfig(ori=ori, normal=normal, depth=depth, out_lightmap=out_lightmap, out_relit=out_relit)
-        phys_cfg.add_mask(f'/mnt/HDD7/miayan/paper/relighting_datasets/test_mask_{i}.png', (1,0,0), 1)
+        phys_cfg.add_mask(f'/mnt/HDD3/miayan/paper/scriblit/eval_data/images_flatten/mask/0.png', (1,0,0), 1)
         phys, lightmap = compute_relighting(phys_cfg)
-        phys.save(phys_cfg.out_relit)
-        lightmap.save(phys_cfg.out_light)
+        phys.save(out_lightmap)
+        lightmap.save(out_relit)

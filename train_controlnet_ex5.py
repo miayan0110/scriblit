@@ -353,9 +353,9 @@ def parse_args(input_args=None):
 		),
 	)
 	parser.add_argument(
-		"--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
+		"--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
 	)
-	parser.add_argument("--num_train_epochs", type=int, default=20)
+	parser.add_argument("--num_train_epochs", type=int, default=40)
 	parser.add_argument(
 		"--max_train_steps",
 		type=int,
@@ -627,7 +627,7 @@ def parse_args(input_args=None):
 	parser.add_argument(
 		"--dataset",
 		type=str,
-		default="/mnt/HDD7/miayan/paper/relighting_datasets/lsun_test_new_phys"
+		default="/mnt/HDD3/miayan/paper/relighting_datasets/"
 	)
 
 	if input_args is not None:
@@ -663,7 +663,7 @@ def parse_args(input_args=None):
 
 	return args
 
-def pred_x0_latents(noise_scheduler, model_pred, x_t, t):
+def pred_x0_latents_batchsize_1(noise_scheduler, model_pred, x_t, t):
     """ v2
     model_pred: UNet 對應 prediction_type 的輸出 (ε or v)，shape = (B,4,H,W)
     x_t:       噪聲後的 latents (B,4,H,W) —— 注意是「影像 latents」，不是 8 通道 cat
@@ -672,6 +672,36 @@ def pred_x0_latents(noise_scheduler, model_pred, x_t, t):
     """
     step_out = noise_scheduler.step(model_pred, t, x_t, return_dict=True)
     return step_out.pred_original_sample  # 就是 \hat{x}_0
+
+def pred_x0_latents(noise_scheduler, model_pred, x_t, t):
+    """
+    model_pred: (B, 4, H, W)  来自 UNet
+    x_t:       (B, 4, H, W)  noisy latents
+    t:         (B,) or scalar timestep(s)
+    回傳:      (B, 4, H, W) 对应每个 sample 的 \hat{x}_0
+    """
+    # t 是 tensor 且有 batch 維度 → 每張圖用自己的 t
+    if isinstance(t, torch.Tensor) and t.ndim > 0:
+        B = t.shape[0]
+        preds = []
+        for i in range(B):
+            # 每一次只取一張圖 + 一個 scalar t
+            ti = int(t[i].item())
+            step_out = noise_scheduler.step(
+                model_pred[i:i+1],  # (1,4,H,W)
+                ti,                 # scalar
+                x_t[i:i+1],         # (1,4,H,W)
+                return_dict=True,
+            )
+            preds.append(step_out.pred_original_sample)  # (1,4,H,W)
+
+        return torch.cat(preds, dim=0)  # (B,4,H,W)
+
+    # 否則 t 本來就是 scalar 的情況
+    t_scalar = int(t) if not isinstance(t, torch.Tensor) else int(t.item())
+    step_out = noise_scheduler.step(model_pred, t_scalar, x_t, return_dict=True)
+    return step_out.pred_original_sample
+
 
 
 def write_tb_log(image, tag, n_img, log_writer, i):
@@ -729,10 +759,10 @@ def main(args):
 	total_loss = 0
 	total_latent_loss = 0
 	total_image_loss = 0
-	total_cond_loss = 0
+	total_area_loss = 0
 	total_phys_loss = 0
 	total_intensity_loss = 0
-	# total_recon_loss = 0
+	total_recon_loss = 0
 	if args.report_to == "wandb" and args.hub_token is not None:
 		raise ValueError(
 			"You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -814,10 +844,8 @@ def main(args):
 		unet = UNet2DConditionModel.from_pretrained(
 			args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
 		)
-		unet_path = "./%s/custom_unet.pth"%args.pretrain_unet_path
-		unet.load_state_dict(torch.load(unet_path), strict=False)
   
-		cond_encoder = CustomEncoder(int(unet.config.cross_attention_dim), K=4, Bi=0, Bc=4)
+		cond_encoder = CustomEncoder(int(unet.config.cross_attention_dim), K=4, Bi=4, Bc=4)	## Bi原本是設0
 		
 		if args.controlnet_model_name_or_path:
 			logger.info("Loading existing controlnet weights")
@@ -885,6 +913,10 @@ def main(args):
 	vae.requires_grad_(False)
 	if 8 != unet.config["in_channels"]:
 		replace_unet_conv_in(unet)
+   
+	if args.hf_version is not None:
+		unet_path = "./%s/custom_unet.pth"%args.pretrain_unet_path
+		unet.load_state_dict(torch.load(unet_path), strict=False)
 
 
 
@@ -1038,15 +1070,15 @@ def main(args):
 		accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
 	# Train!
-    # # Load models for predicting albedo, depth, and normal
-	# logger.info("***** Load models *****")
-	# albedo_model = load_models(path='v2', model_dir='/mnt/HDD7/miayan/paper/scriblit/dataset/iid', device='cpu')
-	# # normal_model = DSINE().to('cpu')
-	# # normal_model = dep_nor_utils.load_checkpoint('/mnt/HDD7/miayan/paper/scriblit/dep_nor/projects/dsine/checkpoints/exp001_cvpr2024/dsine.pt', normal_model)
-	# # normal_model.eval()
+    # Load models for predicting albedo, depth, and normal
+	logger.info("***** Load models *****")
+	albedo_model = load_models(path='v2', model_dir='/mnt/HDD7/miayan/paper/scriblit/dataset/iid', device='cpu')
+	# normal_model = DSINE().to('cpu')
+	# normal_model = dep_nor_utils.load_checkpoint('/mnt/HDD7/miayan/paper/scriblit/dep_nor/projects/dsine/checkpoints/exp001_cvpr2024/dsine.pt', normal_model)
+	# normal_model.eval()
 	normal_model = torch.hub.load("Stable-X/StableNormal", "StableNormal", trust_repo=True)
 	_move_to_device(normal_model, 'cpu')
-	# depth_pipe = depth_pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf", device='cpu')
+	depth_pipe = depth_pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf", device='cpu')
 
 	total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -1100,7 +1132,7 @@ def main(args):
 	image_logs = None
 	for epoch in range(first_epoch, args.num_train_epochs):
 		for step, batch in enumerate(train_dataloader):
-			with accelerator.accumulate(controlnet):
+			with accelerator.accumulate(controlnet):				
 				# Convert images to latent space
 				latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
 				latents = latents * vae.config.scaling_factor
@@ -1154,66 +1186,67 @@ def main(args):
 
 				pred_z0 = pred_x0_latents(noise_scheduler, model_pred, noisy_latents, timesteps)
 				del noisy_latents
-				del controlnet_cond_recon, model_pred
 				torch.cuda.empty_cache()
     
 				## Physical loss
-				# phys_loss = F.mse_loss(pred_z0.float(), latents.float(), reduction="mean")
+				phys_loss = F.mse_loss(pred_z0.float(), latents.float(), reduction="mean")
     
-				# I_relit = vae.decode(pred_z0.detach() / vae.config.scaling_factor).sample
+				I_relit = vae.decode(pred_z0.detach() / vae.config.scaling_factor).sample
 				I_relit = vae.decode(pred_z0 / vae.config.scaling_factor).sample
-				# pseudo_gt = batch["pixel_values"].to(dtype=weight_dtype)
-				# mask = batch["mask"].to(dtype=weight_dtype)
-				# mask = mask.repeat(1, 3, 1, 1)
+				del pred_z0
+       
+				pseudo_gt = batch["pixel_values"].to(dtype=weight_dtype)
+				mask = batch["mask"].to(dtype=weight_dtype)
+				mask = mask.repeat(1, 3, 1, 1)
     
 				## Area loss
-				# masked_I_relit = I_relit * mask
-				# masked_pseudo_gt = pseudo_gt * mask
-				# diff = (masked_I_relit - masked_pseudo_gt).abs()  # [B,3,H,W]
-				# denom = mask.sum(dim=(1,2,3)) + 1e-8  # [B]
-				# per_sample = diff.sum(dim=(1,2,3)) / denom  # [B]
-				# cond_loss = per_sample.mean()  # scalar
-				# del pred_z0, diff, denom, per_sample, mask, masked_pseudo_gt
+				masked_I_relit = I_relit * mask
+				masked_pseudo_gt = pseudo_gt * mask
+				diff = (masked_I_relit - masked_pseudo_gt).abs()  # [B,3,H,W]
+				denom = mask.sum(dim=(1,2,3)) + 1e-8  # [B]
+				per_sample = diff.sum(dim=(1,2,3)) / denom  # [B]
+				area_loss = per_sample.mean()  # scalar
+				del diff, denom, per_sample, mask, masked_pseudo_gt
     
 				## Intensity loss
-				# lightmap_gt = batch["lightmap"].to(dtype=weight_dtype)
-				# lightmap_pred = calculate_pred_lightmap(I_relit, pseudo_gt)
-				# intensity_loss = F.l1_loss(lightmap_pred, lightmap_gt)
-				# del lightmap_pred, lightmap_gt, pseudo_gt
+				lightmap_gt = batch["lightmap"].to(dtype=weight_dtype)
+				lightmap_pred = calculate_pred_lightmap(I_relit, pseudo_gt)
+				intensity_loss = F.l1_loss(lightmap_pred, lightmap_gt)
+				del lightmap_pred, lightmap_gt, pseudo_gt
 
 				## Reconstruction loss
 				alb_loss, normal_loss, depth_loss = 0.0, 0.0, 0.0
-				# recon_alb = gen_albedo(alb_to_pil(I_relit), albedo_model, latents.device)	# tensor [1,3,512,512]
-				# recon_alb_latents = vae.encode(recon_alb.to(dtype=weight_dtype).to(latents.device)).latent_dist.sample()
-				# recon_alb_latents = recon_alb_latents * vae.config.scaling_factor
-				# alb_loss = F.mse_loss(recon_alb_latents.float(), albedo_latents.float(), reduction="mean")
-				# del recon_alb, recon_alb_latents
+				recon_alb = gen_albedo(alb_to_pil(I_relit), albedo_model, latents.device)	# tensor [1,3,512,512]
+				recon_alb_latents = vae.encode(recon_alb.to(dtype=weight_dtype).to(latents.device)).latent_dist.sample()
+				recon_alb_latents = recon_alb_latents * vae.config.scaling_factor
+				alb_loss = F.mse_loss(recon_alb_latents.float(), albedo_latents.float(), reduction="mean")
+				del recon_alb, recon_alb_latents
 
 				recon_normal = normal_estimation_sn(alb_to_pil(I_relit), normal_model, latents.device)
 				recon_normal = img_transforms(recon_normal, 'side_cond').unsqueeze(0).to(dtype=weight_dtype).to(latents.device)
 				normal_loss = F.mse_loss(recon_normal.float(), batch["normal"].to(dtype=weight_dtype).float().to(latents.device), reduction="mean")
 				del recon_normal
 
-				# recon_depth = depth_estimation(alb_to_pil(I_relit), depth_pipe, latents.device)
-				# recon_depth = img_transforms(recon_depth, 'side_cond').unsqueeze(0).to(dtype=weight_dtype).to(latents.device)
-				# depth_loss = F.mse_loss(recon_depth.float(), batch["depth"].to(dtype=weight_dtype).float().to(latents.device), reduction="mean")
-				# del recon_depth
+				recon_depth = depth_estimation(alb_to_pil(I_relit), depth_pipe, latents.device)
+				recon_depth = img_transforms(recon_depth, 'side_cond').unsqueeze(0).to(dtype=weight_dtype).to(latents.device)
+				depth_loss = F.mse_loss(recon_depth.float(), batch["depth"].to(dtype=weight_dtype).float().to(latents.device), reduction="mean")
+				del recon_depth
 
 				recon_loss = alb_loss + normal_loss + depth_loss
 				del alb_loss, normal_loss, depth_loss
 				torch.cuda.empty_cache()
 
-				# # Get the target for loss depending on the prediction type
-				# if noise_scheduler.config.prediction_type == "epsilon":	
-				# 	target = noise
-				# elif noise_scheduler.config.prediction_type == "v_prediction":
-				# 	target = noise_scheduler.get_velocity(latents, noise, timesteps)
-				# else:
-				# 	raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-				# latent_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-				# control_target = batch["control_target"].to(dtype=weight_dtype)
-				# image_loss = F.mse_loss(controlnet_cond_recon, control_target)
-				loss = recon_loss
+				# Get the target for loss depending on the prediction type
+				if noise_scheduler.config.prediction_type == "epsilon":	
+					target = noise
+				elif noise_scheduler.config.prediction_type == "v_prediction":
+					target = noise_scheduler.get_velocity(latents, noise, timesteps)
+				else:
+					raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+				latent_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+				control_target = batch["control_target"].to(dtype=weight_dtype)
+				image_loss = F.mse_loss(controlnet_cond_recon, control_target)
+				loss = phys_loss + latent_loss + image_loss + area_loss * 10.0
 
 				accelerator.backward(loss)
 				if accelerator.sync_gradients:
@@ -1223,16 +1256,16 @@ def main(args):
 				lr_scheduler.step()
 				optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
-				# del controlnet_cond_recon, model_pred
+				del controlnet_cond_recon, model_pred
 				del albedo_latents, latents
 				torch.cuda.empty_cache()
 
 				total_loss += loss.data
-				# total_latent_loss += latent_loss.data
-				# total_image_loss += image_loss.data
-				# total_cond_loss += cond_loss.data
-				# total_phys_loss += phys_loss.data
-				# total_intensity_loss += intensity_loss.data
+				total_latent_loss += latent_loss.data
+				total_image_loss += image_loss.data
+				total_area_loss += area_loss.data
+				total_phys_loss += phys_loss.data
+				total_intensity_loss += intensity_loss.data
 				total_recon_loss += recon_loss.data
 
 			# Checks if the accelerator has performed an optimization step behind the scenes
@@ -1243,18 +1276,18 @@ def main(args):
 				if accelerator.is_main_process:
 					if global_step % args.checkpointing_steps == 0:
 						log_writer.add_scalars('Total Loss', {'train': total_loss/args.checkpointing_steps}, global_step)
-						# log_writer.add_scalars('Latent Loss', {'train': total_latent_loss/args.checkpointing_steps}, global_step)
-						# log_writer.add_scalars('Image Loss', {'train': total_image_loss/args.checkpointing_steps}, global_step)
-						# log_writer.add_scalars('Cond Loss', {'train': total_cond_loss/args.checkpointing_steps}, global_step)
-						# log_writer.add_scalars('Phys Loss', {'train': total_phys_loss/args.checkpointing_steps}, global_step)
-						# log_writer.add_scalars('Intensity Loss', {'train': total_intensity_loss/args.checkpointing_steps}, global_step)
+						log_writer.add_scalars('Latent Loss', {'train': total_latent_loss/args.checkpointing_steps}, global_step)
+						log_writer.add_scalars('Image Loss', {'train': total_image_loss/args.checkpointing_steps}, global_step)
+						log_writer.add_scalars('Area Loss', {'train': total_area_loss/args.checkpointing_steps}, global_step)
+						log_writer.add_scalars('Phys Loss', {'train': total_phys_loss/args.checkpointing_steps}, global_step)
+						log_writer.add_scalars('Intensity Loss', {'train': total_intensity_loss/args.checkpointing_steps}, global_step)
 						log_writer.add_scalars('Recon Loss', {'train': total_recon_loss/args.checkpointing_steps}, global_step)
 						total_loss = 0
 						total_latent_loss = 0
 						total_image_loss = 0
 						write_tb_log_source(batch["ori_img"], 'img_src', n_img, log_writer, global_step)
 						write_tb_log_source(batch['pixel_values'], 'pseudo_GT', n_img, log_writer, global_step)
-						write_tb_log_source(I_relit, 'I_relight', n_img, log_writer, global_step)
+						# write_tb_log_source(I_relit, 'I_relight', n_img, log_writer, global_step)
 						# write_tb_log_source(masked_I_relit, 'masked_I_relight', n_img, log_writer, global_step)
 						write_tb_log(batch["conditioning_pixel_values"][:,:3,:,:], 'normal', n_img, log_writer, global_step)
 						write_tb_log(batch["conditioning_pixel_values"][:,3:6,:,:], 'cond_lightmap', n_img, log_writer, global_step)

@@ -120,7 +120,7 @@ def to_pil_rgb(arr):
 
     return Image.fromarray(arr, mode="RGB")
 
-def gen_albedo(ex, intrinsic_model, device):
+def gen_albedo(ex, intrinsic_model, device, offload=True):
 	pil_img = pil_from_any(ex)
 	np_rgb = to_rgb_numpy(pil_img)
 
@@ -135,8 +135,9 @@ def gen_albedo(ex, intrinsic_model, device):
 		device=device
 	)
 
-	_move_to_device(intrinsic_model, 'cpu')
-	torch.cuda.empty_cache()
+	if offload:
+		_move_to_device(intrinsic_model, 'cpu')
+		torch.cuda.empty_cache()
 
 	def view(img, p=100):
 		img = img ** (1/2.2)
@@ -148,18 +149,20 @@ def gen_albedo(ex, intrinsic_model, device):
 
 
 ## DSINE: depth & normal estimation
-def depth_estimation(img, pipe, device):
-    pipe.model.to(device)
-    pipe.device = torch.device(device) if not isinstance(device, torch.device) else device
+def depth_estimation(img, pipe, device, offload=True):
+    if pipe.device != torch.device(device):
+        pipe.model.to(device)
+        pipe.device = torch.device(device) if not isinstance(device, torch.device) else device
     depth = pipe(img)["depth"]
-
-    pipe.model.to('cpu')
-    pipe.device = torch.device('cpu')
-    torch.cuda.empty_cache()
+    
+    if offload:
+        pipe.model.to('cpu')
+        pipe.device = torch.device('cpu')
+        torch.cuda.empty_cache()
 
     return depth
 
-def normal_estimation(img, model, device):
+def normal_estimation(img, model, device, offload=True):
     _move_to_device(model, device)
     img = img.convert("RGB")
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -176,8 +179,9 @@ def normal_estimation(img, model, device):
     intrins[:, 1, 2] += lrtb[2]
 
     pred_norm = model(img, intrins=intrins)[-1]
-    _move_to_device(model, 'cpu')
-    torch.cuda.empty_cache()
+    if offload:
+        _move_to_device(model, 'cpu')
+        torch.cuda.empty_cache()
 
     pred_norm = pred_norm[:, :, lrtb[2]:lrtb[2]+orig_H, lrtb[0]:lrtb[0]+orig_W]
 
@@ -187,11 +191,12 @@ def normal_estimation(img, model, device):
 
     return im
 
-def normal_estimation_sn(img, predictor, device):
+def normal_estimation_sn(img, predictor, device, offload=True):
     _move_to_device(predictor, device)
     img = img.convert("RGB")
     normal = predictor(img)
-    _move_to_device(predictor, 'cpu')
+    if offload:
+        _move_to_device(predictor, 'cpu')
     return normal
 
 

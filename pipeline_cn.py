@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import PIL.Image
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
@@ -29,8 +30,6 @@ from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionS
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers import StableDiffusionControlNetPipeline
 from network_controlnet import ControlNetModel
-
-from light_cond_encoder import CustomEncoder
 
 logger = logging.get_logger(__name__)
 
@@ -203,7 +202,7 @@ class CustomControlNetPipeline(
 		scheduler: KarrasDiffusionSchedulers,
 		safety_checker: StableDiffusionSafetyChecker,
 		feature_extractor: CLIPImageProcessor,
-		cond_encoder: CustomEncoder,
+		cond_encoder: nn.Module,
 		image_encoder: CLIPVisionModelWithProjection = None,
 		requires_safety_checker: bool = True,
 	):
@@ -882,11 +881,15 @@ class CustomControlNetPipeline(
 		assert emb.shape == (w.shape[0], embedding_dim)
 		return emb
 	
-	def encode_light(self, intensity, color, device, num_images_per_prompt):
+	def encode_light(self, intensity, color, device, num_images_per_prompt, ambient=None):
 		if self.cond_encoder is None:
 			raise ValueError("cond_encoder not set on pipeline")
 		# intensity, color: tensors on device, shape [B,1], [B,3] in [0,1]
-		light_embeds = self.cond_encoder(intensity, color)  # (B, K, D)
+		if ambient is not None:
+			light_embeds = self.cond_encoder(intensity, ambient, color)
+		else:
+			light_embeds = self.cond_encoder(intensity, color)  # (B, K, D)
+   
 		# 對齊 dtype
 		if self.unet is not None:
 			prompt_embeds_dtype = self.unet.dtype
@@ -944,6 +947,7 @@ class CustomControlNetPipeline(
 		self,
 		intensity: Optional[torch.Tensor]=None,
 		color: Optional[torch.Tensor]=None,
+		ambient: Optional[torch.Tensor]=None,
 		prompt: Union[str, List[str]] = None,
 		image: PipelineImageInput = None,
 		height: Optional[int] = None,
@@ -1183,7 +1187,8 @@ class CustomControlNetPipeline(
 			intensity=intensity.to(device),
 			color=color.to(device),
 			device=device,
-			num_images_per_prompt=num_images_per_prompt
+			num_images_per_prompt=num_images_per_prompt,
+			ambient=ambient.to(device) if ambient is not None else None
 		)
 		# For classifier free guidance, we need to do two forward passes.
 		# Here we concatenate the unconditional and text embeddings into a single batch
