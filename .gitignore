@@ -8,6 +8,8 @@ scribblelight_controlnet/*
 *.pt
 *.pth
 *.safetensors
+eval_data/*
+train_ex*/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
