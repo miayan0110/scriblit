@@ -4,6 +4,11 @@
 # 使用方式：bash training_worker.sh <GPU_ID>
 # 例如：bash training_worker.sh 0
 
+## training queue 格式
+# 格式： "Config路徑 | Output資料夾名稱 | 目標Checkpoint名稱"
+# 例如：
+# /mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex8_11|checkpoint-235260
+
 GPU_ID=$1
 QUEUE_FILE="training_queue.txt"
 LOCK_FILE="training_queue.lock"
@@ -148,22 +153,41 @@ while true; do
     
     # 去 queue 搶任務
     NEXT_TASK=""
-    (
-        flock -x 200
-        if [ -s "$QUEUE_FILE" ]; then
-            NEXT_TASK=$(head -n 1 "$QUEUE_FILE")
-            sed -i '1d' "$QUEUE_FILE"
-        fi
-    ) 200>"$LOCK_FILE"
+    
+    # 1. 開啟 Lock 檔案描述符 (FD 200)
+    exec 200>"$LOCK_FILE"
+    
+    # 2. 取得鎖 (排他鎖 Exclusive Lock)
+    flock -x 200
+    
+    # 3. 讀取並刪除 (現在變數是在同一個 Shell 裡，不會消失了)
+    if [ -s "$QUEUE_FILE" ]; then
+        # tr -d '\r' 是為了去除 Windows 換行符號，防止讀錯
+        NEXT_TASK=$(head -n 1 "$QUEUE_FILE" | tr -d '\r')
+        sed -i '1d' "$QUEUE_FILE"
+    fi
+    
+    # 4. 解鎖 (雖然 exec 結束會自動解，但顯式寫出來比較好)
+    flock -u 200
+    
+    # ========================
 
     if [ -z "$NEXT_TASK" ]; then
         echo -ne "💤 任務池空了，GPU $GPU_ID 待機中... $(date +'%H:%M:%S')\r"
         sleep 60
     else
         echo "🎉 GPU $GPU_ID 搶到任務！"
+        # 顯示搶到的內容，方便除錯
+        echo "   內容: $NEXT_TASK"
+        
         IFS="|" read -r q_cfg q_out q_ckpt <<< "$NEXT_TASK"
         
-        # 1. 啟動任務
+        # 基本檢查，防止讀到空行導致爆炸
+        if [ -z "$q_cfg" ] || [ -z "$q_out" ]; then
+            echo "⚠️  讀取到的任務格式怪怪的，跳過..."
+            continue
+        fi
+
         mkdir -p "$q_out"
         log_file="./$q_out/train_log_$(date +%Y%m%d_%H%M).txt"
         
@@ -171,9 +195,8 @@ while true; do
         
         echo "🚀 啟動: $q_out"
         nohup bash -c "$FULL_CMD" > "$log_file" 2>&1 &
-        sleep 20 # 等待啟動
+        sleep 20 
         
-        # 2. 進入監控 (直到這個任務做完)
         run_watchdog "$q_cfg" "$q_out" "$q_ckpt"
     fi
 done

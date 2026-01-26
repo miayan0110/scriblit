@@ -10,6 +10,7 @@ scribblelight_controlnet/*
 *.safetensors
 eval_data/*
 train_ex*/*
+*.lock
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
