@@ -13,11 +13,22 @@ GPU_ID=$1
 QUEUE_FILE="training_queue.txt"
 LOCK_FILE="training_queue.lock"
 
-# --- 設定區 ---
+# ================= 設定區 =================
+
+# --- 排程啟動設定 ---
+# ENABLE_SCHEDULE: 是否開啟定時功能？ ("true" = 開啟, "false" = 關閉/立刻執行)
+ENABLE_SCHEDULE="true"
+
+# START_TIME: 你想幾點開始跑？ (支援格式: "tomorrow 04:00", "03:00", "now + 5 hours")
+# 範例 1: "tomorrow 04:00"  (明天凌晨 4 點)
+# 範例 2: "23:30"           (今天的 23:30，如果已經過了會變成明天，視 date 指令而定，建議寫清楚 tomorrow)
+START_TIME="tomorrow 08:00"
+
+# --- 參數設定 ---
 PYTHON_BIN="/mnt/HDD3/miayan/paper/envs/scriblit/bin/python3.10"
 SCRIPT_PATH="train.py"
 VALIDATION_FILE="custom_unet.pth"
-CHECK_INTERVAL=30
+CHECK_INTERVAL=300   # 檢查間隔 (秒)
 # 顯存門檻 (MB)：如果 GPU 即使有 process 但吃少於這個數字，視為空閒 (可搶)
 MEM_THRESHOLD=10000 
 
@@ -29,6 +40,38 @@ fi
 # 自動計算 Port (避免雙卡衝突)
 CURRENT_PORT=$((29500 + GPU_ID))
 ACC_ARGS="--main_process_port=$CURRENT_PORT"
+
+# ================= [新增] 等待邏輯區塊 =================
+
+if [ "$ENABLE_SCHEDULE" == "true" ]; then
+    echo "⏰ 排程模式已開啟！目標啟動時間: $START_TIME"
+    
+    # 計算現在與目標時間的秒數差
+    # date -d 是 Linux 的強大功能，能自動解析文字
+    TARGET_SEC=$(date -d "$START_TIME" +%s)
+    NOW_SEC=$(date +%s)
+    DIFF_SEC=$((TARGET_SEC - NOW_SEC))
+    
+    if [ $DIFF_SEC -gt 0 ]; then
+        # 把秒數換算成小時分鐘顯示給你看
+        WAIT_HRS=$((DIFF_SEC / 3600))
+        WAIT_MIN=$(( (DIFF_SEC % 3600) / 60 ))
+        
+        echo "💤 現在時間: $(date +'%H:%M:%S')"
+        echo "⏳ 腳本將進入睡眠，等待 $WAIT_HRS 小時 $WAIT_MIN 分鐘..."
+        echo "   (預計於 $(date -d "$START_TIME" +'%Y-%m-%d %H:%M:%S') 醒來開工)"
+        
+        # 讓腳本睡覺
+        sleep $DIFF_SEC
+        
+        echo ""
+        echo "⏰ 鈴鈴鈴！時間到了！工人起床開始檢查 GPU $GPU_ID..."
+    else
+        echo "⚠️  注意：設定的時間 ($START_TIME) 已經過去了，腳本將立即開始執行！"
+    fi
+else
+    echo "🚀 排程模式未開啟，立即開始執行..."
+fi
 
 # ================= 核心函式 =================
 
