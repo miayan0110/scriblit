@@ -291,15 +291,16 @@ for i, idx in enumerate(indices_to_run):
     ambient_val = manual_ambient
     if returns_ambient:
         ambient_val = result['ambient']
-        # for experiment visualization
+        # ======== for experiment visualization ========
         lightmap_rgb = result['lightmap_rgb']
         lightmap_rgb.save(f"./inference/{args.version}/debug_illumination_{idx}_{args.seed}.png")
+        # ==============================================
     else:
         lightmap_rgb = None
         ambient_val = getattr(config, 'ambient', 0.75)
     
     lightmap = result['lightmap'].convert('RGB')
-    lightmap.save(f"./inference/{args.version}/debug_lightmap_{idx}_{args.seed}.png")   # for experiment visualization
+    lightmap.save(f"./inference/{args.version}/debug_lightmap_{idx}_{args.seed}.png")   # ======== for experiment visualization ========
     
     
     if albedo_wrapper is not None:
@@ -307,7 +308,7 @@ for i, idx in enumerate(indices_to_run):
         with torch.no_grad():
             pred_albedo = albedo_wrapper(ori_tensor)
             
-        # for experiment visualization
+        # ======== for experiment visualization ========
         debug_alb_img = to_pil_image(pred_albedo.squeeze(0).cpu().clamp(0, 1))
         debug_alb_img.save(f"./inference/{args.version}/debug_albedo_{idx}_{args.seed}.png")
         if lightmap_rgb is not None:
@@ -316,6 +317,7 @@ for i, idx in enumerate(indices_to_run):
             phys_recon_tensor = pred_albedo * illum_tensor
             phy_recon = to_pil_image(phys_recon_tensor.squeeze(0).clamp(0, 1).cpu())
             phy_recon.save(f"./inference/{args.version}/debug_phys_recon_{idx}_{args.seed}.png")
+        # ==============================================
         
         albedo = (pred_albedo.cpu() * 2.0) - 1.0
         albedo = torch.clamp(albedo, -1.0, 1.0)
