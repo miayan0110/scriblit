@@ -11,7 +11,7 @@ model:
   tokenizer_name: null
   # Custom params
   hf_repo_id: "Miayan/project"
-  hf_version: null # e.g. "train_ex6" or null
+  hf_version: null # e.g. "train_ex6" or null (從哪個hf上checkpoint繼續train)
   pretrain_unet_path: "scribblelight_controlnet/checkpoint-10000"
   resume_from_checkpoint: "latest" # or path
   enable_ambient_cond: true # true: Intensity + Ambient + Color; false: Intensity + Color
