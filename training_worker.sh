@@ -17,20 +17,26 @@ LOCK_FILE="training_queue.lock"
 
 # --- 排程啟動設定 ---
 # ENABLE_SCHEDULE: 是否開啟定時功能？ ("true" = 開啟, "false" = 關閉/立刻執行)
-ENABLE_SCHEDULE="true"
+ENABLE_SCHEDULE="false"
 
 # START_TIME: 你想幾點開始跑？ (支援格式: "tomorrow 04:00", "03:00", "now + 5 hours")
 # 範例 1: "tomorrow 04:00"  (明天凌晨 4 點)
 # 範例 2: "23:30"           (今天的 23:30，如果已經過了會變成明天，視 date 指令而定，建議寫清楚 tomorrow)
 START_TIME="tomorrow 08:00"
 
+# --- VIP 迴避名單 ---
+# 請在引號內填入 "同學的帳號名稱"，多個人用空白隔開
+# 範例: VIP_USERS="alex bob teacher"
+# 只要是這些人佔用 GPU，不管顯存大小，腳本都會乖乖等待
+VIP_USERS="yicheng lin004"
+
 # --- 參數設定 ---
 PYTHON_BIN="/mnt/HDD3/miayan/paper/envs/scriblit/bin/python3.10"
 SCRIPT_PATH="train.py"
 VALIDATION_FILE="custom_unet.pth"
-CHECK_INTERVAL=300   # 檢查間隔 (秒)
+CHECK_INTERVAL=30   # 檢查間隔 (秒)
 # 顯存門檻 (MB)：如果 GPU 即使有 process 但吃少於這個數字，視為空閒 (可搶)
-MEM_THRESHOLD=10000 
+MEM_THRESHOLD=25000 
 
 if [ -z "$GPU_ID" ]; then
     echo "❌ 請指定 GPU ID (例如: ./training_worker.sh 0)"
@@ -41,7 +47,7 @@ fi
 CURRENT_PORT=$((29500 + GPU_ID))
 ACC_ARGS="--main_process_port=$CURRENT_PORT"
 
-# ================= [新增] 等待邏輯區塊 =================
+# ================= 等待邏輯區塊 =================
 
 if [ "$ENABLE_SCHEDULE" == "true" ]; then
     echo "⏰ 排程模式已開啟！目標啟動時間: $START_TIME"
@@ -77,8 +83,7 @@ fi
 
 # 1. 檢查 GPU 狀態 (回傳: "BUSY_MY", "BUSY_OTHER", "FREE")
 check_gpu_status() {
-    # 取得該 GPU 上所有 process 的 PID 和 使用者ID
-    # 格式: PID, UID, USED_MEMORY
+    # 取得 PID 和 Memory
     local proc_info=$(nvidia-smi -i $GPU_ID --query-compute-apps=pid,used_memory --format=csv,noheader,nounits)
 
     if [ -z "$proc_info" ]; then
@@ -86,29 +91,46 @@ check_gpu_status() {
         return
     fi
 
-    # 讀取每一行 Process
-    local is_free="FREE"
-    
+    # 預設狀態
+    local final_status="FREE"
+
+    # 逐行檢查每個 Process
     while IFS=, read -r pid used_mem; do
-        # 檢查是不是我在跑 train.py
-        if ps -p $pid -o args= 2>/dev/null | grep -q "$SCRIPT_PATH"; then
-            # 檢查 owner 是不是我
-            local owner=$(ps -o user= -p $pid)
-            if [ "$owner" == "$USER" ]; then
+        # 去除空白
+        pid=$(echo $pid | xargs)
+        used_mem=$(echo $used_mem | xargs)
+
+        # 1. 取得該 Process 的使用者名稱 (Owner)
+        local owner=$(ps -o user= -p $pid)
+        owner=$(echo $owner | xargs) # 去空白
+
+        # 2. 判斷邏輯
+        # A. 如果是我自己
+        if [ "$owner" == "$USER" ]; then
+            # 進一步檢查是不是 train.py
+            if ps -p $pid -o args= 2>/dev/null | grep -q "$SCRIPT_PATH"; then
                 echo "BUSY_MY"
                 return
             fi
+            # 如果是我自己在跑別的東西 (例如 jupyter)，視為 BUSY_OTHER，以免自己打架
         fi
 
-        # 如果不是我的 train.py，檢查顯存佔用
-        # 去除空白
-        used_mem=$(echo $used_mem | xargs)
-        if [ "$used_mem" -gt "$MEM_THRESHOLD" ]; then
-            is_free="BUSY_OTHER"
+        # B. 如果是 VIP 名單裡的人 (絕對迴避)
+        # 使用 grep 檢查 owner 是否在 VIP_USERS 字串中
+        if [[ " $VIP_USERS " =~ " $owner " ]]; then
+            echo "BUSY_VIP:$owner" # 回傳特殊狀態，並附上名字
+            return
         fi
+
+        # C. 如果是其他路人
+        # 只有當顯存大於門檻時，才視為忙碌
+        if [ "$used_mem" -gt "$MEM_THRESHOLD" ]; then
+            final_status="BUSY_OTHER:$owner" # 標記是被誰佔用
+        fi
+
     done <<< "$proc_info"
 
-    echo "$is_free"
+    echo "$final_status"
 }
 
 # 2. 執行監控與救援 (Watchdog)
@@ -168,66 +190,61 @@ run_watchdog() {
 
 # ================= 主流程 =================
 
-echo "🚀 啟動 GPU $GPU_ID 智慧工人 (閾值: ${MEM_THRESHOLD}MB)"
+echo "🚀 啟動 GPU $GPU_ID 智慧工人 (VIP名單: $VIP_USERS)"
+touch "$LOCK_FILE"
 
 while true; do
-    STATUS=$(check_gpu_status)
+    STATUS_RAW=$(check_gpu_status)
+    
+    # 解析狀態，因為可能是 "BUSY_VIP:lin004" 這種格式
+    STATUS=$(echo $STATUS_RAW | cut -d':' -f1)
+    OWNER=$(echo $STATUS_RAW | cut -d':' -f2)
 
     if [ "$STATUS" == "BUSY_MY" ]; then
-        echo "🔍 發現 GPU $GPU_ID 已經有我的任務在跑！直接接手監控..."
-        # 這裡比較尷尬，因為我們不知道現在跑的是哪個 config
-        # 但我們可以「盲目監控」：只要 process 死掉且 queue 裡有東西，就假設舊的跑完了
-        # 為了安全，這裡我們做一個簡單的等待迴圈，直到它死掉
-        while [ "$(check_gpu_status)" == "BUSY_MY" ]; do
+        echo "🔍 GPU $GPU_ID 是我自己在跑！接手監控..."
+        while [ "$(echo $(check_gpu_status) | cut -d':' -f1)" == "BUSY_MY" ]; do
             echo -ne "⏳ 監控既有任務中... $(date +'%H:%M:%S')\r"
             sleep 30
         done
         echo ""
-        echo "✅ 既有任務結束 (或中斷)。準備領取新任務..."
+        echo "✅ 既有任務結束。準備領取新任務..."
+        continue
+
+    elif [ "$STATUS" == "BUSY_VIP" ]; then
+        # 遇到同學，絕對等待
+        echo -ne "⛔ 禮讓 VIP ($OWNER) | GPU $GPU_ID 等待中... $(date +'%H:%M:%S')\r"
+        sleep 60
         continue
 
     elif [ "$STATUS" == "BUSY_OTHER" ]; then
-        echo -ne "⛔ GPU $GPU_ID 被其他人佔用 (VRAM > ${MEM_THRESHOLD}MB)，等待中... $(date +'%H:%M:%S')\r"
+        # 遇到路人且顯存很高，等待
+        echo -ne "⛔ 路人 ($OWNER) 佔用高顯存 | GPU $GPU_ID 等待中... $(date +'%H:%M:%S')\r"
         sleep 60
         continue
     fi
 
-    # === STATUS == FREE (可以領任務了) ===
+    # === FREE (可以搶票) ===
     
-    # 去 queue 搶任務
     NEXT_TASK=""
-    
-    # 1. 開啟 Lock 檔案描述符 (FD 200)
     exec 200>"$LOCK_FILE"
-    
-    # 2. 取得鎖 (排他鎖 Exclusive Lock)
     flock -x 200
-    
-    # 3. 讀取並刪除 (現在變數是在同一個 Shell 裡，不會消失了)
     if [ -s "$QUEUE_FILE" ]; then
-        # tr -d '\r' 是為了去除 Windows 換行符號，防止讀錯
         NEXT_TASK=$(head -n 1 "$QUEUE_FILE" | tr -d '\r')
         sed -i '1d' "$QUEUE_FILE"
     fi
-    
-    # 4. 解鎖 (雖然 exec 結束會自動解，但顯式寫出來比較好)
     flock -u 200
     
-    # ========================
-
     if [ -z "$NEXT_TASK" ]; then
         echo -ne "💤 任務池空了，GPU $GPU_ID 待機中... $(date +'%H:%M:%S')\r"
         sleep 60
     else
         echo "🎉 GPU $GPU_ID 搶到任務！"
-        # 顯示搶到的內容，方便除錯
         echo "   內容: $NEXT_TASK"
         
         IFS="|" read -r q_cfg q_out q_ckpt <<< "$NEXT_TASK"
         
-        # 基本檢查，防止讀到空行導致爆炸
         if [ -z "$q_cfg" ] || [ -z "$q_out" ]; then
-            echo "⚠️  讀取到的任務格式怪怪的，跳過..."
+            echo "⚠️  格式錯誤跳過..."
             continue
         fi
 
