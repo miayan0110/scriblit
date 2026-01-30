@@ -1,1 +1,0 @@
-/mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex8_12|checkpoint-235260

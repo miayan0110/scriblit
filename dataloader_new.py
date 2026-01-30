@@ -73,8 +73,8 @@ class Indoor_dataset(Dataset):
         print(f"Dataset Condition Mode: {self.condition_mode}")
         
         # === 6. 讀取 ControlNet 設定 ===
-        # 預設為 False (推薦)，即使用黑底 Lightmap
-        self.use_ambient_in_controlnet = cfg.get('use_ambient_in_controlnet', False)
+        # 預設為 True (推薦)，即使用 RGB Lightmap
+        self.use_ambient_in_controlnet = cfg.get('use_ambient_in_controlnet', True)
         print(f"ControlNet uses Ambient in Lightmap: {self.use_ambient_in_controlnet}")
         
     def __len__(self):

@@ -7,7 +7,7 @@
 ## training queue 格式
 # 格式： "Config路徑 | Output資料夾名稱 | 目標Checkpoint名稱"
 # 例如：
-# /mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex8_11|checkpoint-235260
+# /mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex8_12|checkpoint-235260
 
 GPU_ID=$1
 QUEUE_FILE="training_queue.txt"
@@ -17,24 +17,25 @@ LOCK_FILE="training_queue.lock"
 
 # --- 排程啟動設定 ---
 # ENABLE_SCHEDULE: 是否開啟定時功能？ ("true" = 開啟, "false" = 關閉/立刻執行)
-ENABLE_SCHEDULE="false"
+ENABLE_SCHEDULE="true"
 
 # START_TIME: 你想幾點開始跑？ (支援格式: "tomorrow 04:00", "03:00", "now + 5 hours")
 # 範例 1: "tomorrow 04:00"  (明天凌晨 4 點)
 # 範例 2: "23:30"           (今天的 23:30，如果已經過了會變成明天，視 date 指令而定，建議寫清楚 tomorrow)
-START_TIME="tomorrow 08:00"
+START_TIME="21:00"
 
 # --- VIP 迴避名單 ---
 # 請在引號內填入 "同學的帳號名稱"，多個人用空白隔開
 # 範例: VIP_USERS="alex bob teacher"
 # 只要是這些人佔用 GPU，不管顯存大小，腳本都會乖乖等待
-VIP_USERS="yicheng lin004"
+VIP_USERS="lin004"
 
 # --- 參數設定 ---
 PYTHON_BIN="/mnt/HDD3/miayan/paper/envs/scriblit/bin/python3.10"
 SCRIPT_PATH="train.py"
 VALIDATION_FILE="custom_unet.pth"
-CHECK_INTERVAL=30   # 檢查間隔 (秒)
+CHECK_INTERVAL=30    # 監控"我自己"的任務：每 30 秒檢查一次 (保持敏銳)
+WAIT_INTERVAL=180    # 等待"別人"釋放 GPU：每 3 分鐘檢查一次 (不用太頻繁)
 # 顯存門檻 (MB)：如果 GPU 即使有 process 但吃少於這個數字，視為空閒 (可搶)
 MEM_THRESHOLD=25000 
 
@@ -171,17 +172,32 @@ run_watchdog() {
             return 0 # 成功，返回主迴圈去領下一個任務
         else
             echo "❌ 任務未完成 (OOM或中斷)。"
-            echo "🔄 10秒後原地救援重啟..."
-            sleep 10
-            
+            # === 重啟前的安全檢查 ===
+            while true; do
+                STATUS_RAW=$(check_gpu_status)
+                STATUS=$(echo $STATUS_RAW | cut -d':' -f1)
+                OWNER=$(echo $STATUS_RAW | cut -d':' -f2)
+
+                if [ "$STATUS" == "BUSY_VIP" ]; then
+                    # 遇到 VIP，改用 WAIT_INTERVAL (3分鐘)
+                    echo -ne "⛔ 重啟暫停：VIP ($OWNER) 介入 | GPU $GPU_ID 等待中... $(date +'%H:%M:%S')\r"
+                    sleep $WAIT_INTERVAL
+                elif [ "$STATUS" == "BUSY_OTHER" ]; then
+                    # 遇到路人，改用 WAIT_INTERVAL (3分鐘)
+                    echo -ne "⛔ 重啟暫停：路人 ($OWNER) 佔用 | GPU $GPU_ID 等待中... $(date +'%H:%M:%S')\r"
+                    sleep $WAIT_INTERVAL
+                else
+                    echo ""
+                    echo "✅ GPU 狀態安全，執行救援重啟..."
+                    break
+                fi
+            done
+
             mkdir -p "$output_dir"
             log_file="./$output_dir/train_log_$(date +%Y%m%d_%H%M).txt"
-            
             FULL_CMD="export PYTHONUNBUFFERED=1; CUDA_VISIBLE_DEVICES=$GPU_ID accelerate launch $ACC_ARGS $SCRIPT_PATH --config $config_path --output_dir $output_dir"
-            
             echo "執行: $FULL_CMD"
             nohup bash -c "$FULL_CMD" > "$log_file" 2>&1 &
-            
             sleep 20
             echo "👀 已重啟，繼續監控..."
         fi
