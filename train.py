@@ -335,6 +335,27 @@ def compute_self_recon_loss(cfg, batch, pred_ori_alb, gt_ori_alb, global_step, n
     
     return final_loss, final_loss.item()
 
+def calculate_latent_ssim_loss(x, y, C1=0.01**2, C2=0.03**2):
+    """
+    計算 Latent Space 的 SSIM Loss (1 - SSIM)。
+    x, y: (B, 4, H, W) -> 也就是 pred_z0 和 latents
+    使用 AvgPool2d 來模擬 SSIM 的局部視窗計算。
+    """
+    # 使用 3x3 window
+    mu_x = F.avg_pool2d(x, 3, 1, 1)
+    mu_y = F.avg_pool2d(y, 3, 1, 1)
+
+    sigma_x = F.avg_pool2d(x**2, 3, 1, 1) - mu_x**2
+    sigma_y = F.avg_pool2d(y**2, 3, 1, 1) - mu_y**2
+    sigma_xy = F.avg_pool2d(x*y, 3, 1, 1) - mu_x*mu_y
+
+    ssim_n = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
+    ssim_d = (mu_x**2 + mu_y**2 + C1) * (sigma_x + sigma_y + C2)
+    
+    # 回傳 1 - SSIM (因為我們要 minimize loss)
+    return 1.0 - (ssim_n / ssim_d).mean()
+
+
 ## Config parser
 def parse_args():
     parser = argparse.ArgumentParser(description="ControlNet training script with Config.")
@@ -755,6 +776,16 @@ def main(cfg):
                     phys_loss = F.mse_loss(pred_z0.float(), latents.float(), reduction="mean")
                     total_loss += phys_loss * cfg.losses.phys_loss.weight
                     accumulated_loss['phys_loss'] += phys_loss.item()
+                    
+                # Latent SSIM Loss
+                if cfg.losses.get('ssim_loss', {}).get('enabled', False):
+                    # pred_z0: 預測的去噪 latent
+                    # latents: 真實的 GT latent
+                    loss_ssim = calculate_latent_ssim_loss(pred_z0.float(), latents.float())
+                    
+                    w_ssim = cfg.losses.ssim_loss.get('weight', 0.2)
+                    total_loss += loss_ssim * w_ssim
+                    accumulated_loss['ssim_loss'] = accumulated_loss.get('ssim_loss', 0.0) + loss_ssim.item()
 
                 # Lazy decode
                 I_relit = None

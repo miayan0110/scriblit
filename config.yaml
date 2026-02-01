@@ -1,6 +1,6 @@
 experiment:
   project_name: "relighting_indoors"
-  output_dir: "train_ex8_10"
+  output_dir: "train_ex9"
   logging_dir: "logs"
   report_to: "tensorboard"
 
@@ -17,7 +17,7 @@ model:
   enable_ambient_cond: true # true: Intensity + Ambient + Color; false: Intensity + Color
 
 light_encoder:
-  cross_dim: 768 # SD1.5 dim
+  cross_dim: 768 # SD1.5 dim (這邊的數值不會用到，training會自己拿當下unet的dim來設定)
   K: 4
   Bi: 4
   Bc: 4
@@ -104,6 +104,9 @@ losses:
   image_loss:
     enabled: true
     weight: 1.0
+  ssim_loss:
+    enabled: true
+    weight: 0.2
   area_loss:
     enabled: false
     weight: 10.0
