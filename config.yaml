@@ -1,6 +1,6 @@
 experiment:
   project_name: "relighting_indoors"
-  output_dir: "train_ex9"
+  output_dir: "train_ex9_1"
   logging_dir: "logs"
   report_to: "tensorboard"
 
@@ -40,7 +40,7 @@ data:
   dataset_cache_dir: "/mnt/HDD3/miayan/paper/relighting_datasets/" 
   data_hf_repo_id: "Miayan/physical-relighting-dataset"
   data_split: "test"
-  resolution: 512 
+  resolution: 768 
   dataloader_num_workers: 0
   condition_mode: "lightmap_normal" # "lightmap_normal" or "depth_mask_normal"
 

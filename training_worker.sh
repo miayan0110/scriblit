@@ -7,7 +7,7 @@
 ## training queue 格式
 # 格式： "Config路徑 | Output資料夾名稱 | 目標Checkpoint名稱"
 # 例如：
-# /mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex9|checkpoint-235260
+# /mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex10_1|checkpoint-235260
 
 GPU_ID=$1
 QUEUE_FILE="training_queue.txt"
@@ -22,7 +22,7 @@ ENABLE_SCHEDULE="false"
 # START_TIME: 你想幾點開始跑？ (支援格式: "tomorrow 04:00", "03:00", "now + 5 hours")
 # 範例 1: "tomorrow 04:00"  (明天凌晨 4 點)
 # 範例 2: "23:30"           (今天的 23:30，如果已經過了會變成明天，視 date 指令而定，建議寫清楚 tomorrow)
-START_TIME="21:00"
+START_TIME="tomorrow 00:00"
 
 # --- VIP 迴避名單 ---
 # 請在引號內填入 "同學的帳號名稱"，多個人用空白隔開
