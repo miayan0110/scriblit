@@ -392,8 +392,12 @@ def run_multicond_sweep(ctx, args, dataset, indices):
         "Red":   [255, 0, 0],
         "Green": [0, 255, 0],
         "Blue":  [0, 0, 255],
-        "Warm":  [255, 200, 150],
-        "Cool":  [150, 200, 255]
+        "Yellow":  [255, 255, 0],
+        "Orange":  [255, 165, 0],
+        "Purple":  [128, 0, 128],
+        "Cyan":    [0, 255, 255],
+        "Pink":   [255, 192, 203],
+        "Magenta": [255, 0, 255]
     }
     
     # 定義要測試的強度
