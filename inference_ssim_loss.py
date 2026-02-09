@@ -467,16 +467,16 @@ def _run_inference_internal(ctx, data, args, item):
 # ==========================================
 # 4. Benchmark 模式 (Top 1% SSIM)
 # 說明：
-#   跑大量數據，但不儲存中間圖片（節省空間）。
-#   只保留 SSIM 分數最高的 Top 1% 結果，並存成 HuggingFace Dataset。
-#   使用 Min-Heap 演算法來有效率地篩選 Top K。
+#   跑大量數據，不儲存中間圖片與 JSON。
+#   採用「一邊生成一邊篩選」的 Min-Heap 策略，最後才對 Top 1% 進行排序並存成 CSV。
 # ==========================================
 def run_benchmark_inference(ctx, args, dataset, indices):
     print(f"\n=== Benchmark Mode ===")
     print(f"Total Images: {len(indices)}")
     
+    # 計算 Top 1% 需要保留的數量
     top_k_count = max(1, int(len(indices) * 0.01))
-    print(f"Goal: Save Top {top_k_count} best images (Top 1%) to Dataset.")
+    print(f"Goal: Track Top {top_k_count} best images (Top 1%).")
 
     out_dir = f'./inference/{args.version}/benchmark'
     os.makedirs(out_dir, exist_ok=True)
@@ -491,61 +491,57 @@ def run_benchmark_inference(ctx, args, dataset, indices):
     pbar = tqdm(indices, desc="Benchmarking")
     for idx in pbar:
         item = dataset[idx]
+        # _prepare_batch_data 內部已加入靜音邏輯，不存 debug 圖
         data = _prepare_batch_data(ctx, item, args, idx)
         
+        # 執行推理 (不存圖)
         image = _run_inference_internal(ctx, data, args, item)
 
         score = _calculate_ssim(image, data['ori_pil'])
         total_ssim += score
         processed_count += 1
         
-        # Top K 篩選邏輯
+        # --- 一邊生成一邊篩選 Top 1% ---
         if len(top_k_heap) < top_k_count:
             heapq.heappush(top_k_heap, (score, idx, image, data['ori_pil']))
         else:
-            # 如果 Heap 滿了，檢查這張圖有沒有比 Heap 裡最爛的那張好
+            # 如果 Heap 滿了，且當前分數大於堆積中的最小值，則進行替換
             if score > top_k_heap[0][0]:
                 heapq.heapreplace(top_k_heap, (score, idx, image, data['ori_pil']))
         
+        # 更新進度條顯示當前 1% 的門檻分數
         min_top_score = top_k_heap[0][0] if top_k_heap else 0.0
-        pbar.set_postfix({"Avg": f"{total_ssim/processed_count:.3f}", "Top1%": f"{min_top_score:.3f}"})
+        pbar.set_postfix({"Avg": f"{total_ssim/processed_count:.3f}", "Cutoff": f"{min_top_score:.3f}"})
 
-    # 整理結果
-    final_avg_ssim = total_ssim / processed_count
+    # --- 最後排序與寫入 CSV ---
+    # 對堆積中的結果進行最終由高到低的排序
     top_results = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
     
+    csv_path = os.path.join(out_dir, "top_1_percent_rankings.csv")
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Rank', 'Image_ID', 'SSIM_Score'])
+        for rank, (score, res_idx, _, _) in enumerate(top_results, 1):
+            writer.writerow([rank, res_idx, f"{score:.5f}"])
+
     print("\n" + "="*40)
-    print(f"Benchmark Report")
-    print(f"Total Processed: {processed_count}")
-    print(f"Average SSIM:    {final_avg_ssim:.5f}")
-    print(f"Best SSIM:       {top_results[0][0]:.5f}")
+    print(f"Benchmark Report (Saved to {csv_path})")
+    print(f"Average SSIM:    {total_ssim / processed_count:.5f}")
     print(f"Top 1% Cutoff:   {top_results[-1][0]:.5f}")
     print("="*40)
     
-    # 建立 Dataset
-    data_dict = {
-        "index": [],
-        "ssim": [],
-        "image": [],
-        "target": []
-    }
-    
-    vis_dir = os.path.join(out_dir, "top_images")
-    os.makedirs(vis_dir, exist_ok=True)
-    
-    for score, idx, img, tgt in top_results:
-        data_dict["index"].append(idx)
+    # 建立 Dataset 存檔
+    data_dict = {"index": [], "ssim": [], "image": [], "target": []}
+    for score, res_idx, img, tgt in top_results:
+        data_dict["index"].append(res_idx)
         data_dict["ssim"].append(score)
         data_dict["image"].append(img)
         data_dict["target"].append(tgt)
-        img.save(f"{vis_dir}/rank_{idx}_ssim{score:.3f}.png")
 
     hf_ds = Dataset.from_dict(data_dict)
     save_path = os.path.join(out_dir, "top_1percent_dataset")
     hf_ds.save_to_disk(save_path)
-    
-    print(f"Top {len(top_results)} images saved to: {vis_dir}")
-    print(f"Full Dataset saved to: {save_path}")
+    print(f"Full Top 1% Dataset saved to: {save_path}")
 
 # ==========================================
 # Helper Functions
