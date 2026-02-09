@@ -466,7 +466,7 @@ def run_benchmark_inference(ctx, args, dataset, indices):
 
         # --- 動態篩選邏輯 ---
         # 使用 -n_score 是為了讓 NIQE 越小的人在 tuple 比較中顯得越大
-        current_entry = (s_score, -n_score, idx, image, data['ori_pil'])
+        current_entry = (s_score, -n_score, b_score, l_score, idx, image, data['ori_pil'])
         
         if len(top_k_heap) < top_k_count:
             heapq.heappush(top_k_heap, current_entry)
