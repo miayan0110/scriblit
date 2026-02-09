@@ -22,6 +22,8 @@ from network_controlnet import ControlNetModel
 from datasets import load_dataset, Image as HfImage, Dataset
 import pyiqa
 niqe_metric = pyiqa.create_metric('niqe', device=torch.device('cuda'))
+brisque_metric = pyiqa.create_metric('brisque', device=torch.device('cuda'))
+lpips_metric = pyiqa.create_metric('lpips', device=torch.device('cuda'))
 
 # Relighting API Imports
 import physical_relighting_api_v2 as relighting_api_v2
@@ -334,54 +336,33 @@ def guided_generation(ctx, pipe_kwargs, target_img_tensor, guidance_scale=0.0):
 # ==========================================
 def run_single_inference(ctx, args, dataset, indices):
     print("--- Mode: Single Inference ---")
-    
     out_dir = f'./inference/{args.version}'
     os.makedirs(out_dir, exist_ok=True)
 
-    for i, idx in enumerate(indices):
+    for idx in indices:
         item = dataset[idx]
         data = _prepare_batch_data(ctx, item, args, idx)
         
-        # 準備 Albedo Latents (加入部分 Noise)
-        albedo_latents = ctx['vae'].encode(data['albedo'].to(dtype=torch.float32).cuda()).latent_dist.sample() * ctx['vae'].config.scaling_factor
-        albedo_noise = torch.randn_like(albedo_latents)
-        timesteps_albedo = torch.randint(200, 201, (1,))
-        albedo_latents_noisy = ctx['scheduler'].add_noise(albedo_latents, albedo_noise, timesteps_albedo)
+        # 呼叫統一的推論邏輯
+        image = _run_inference_internal(ctx, data, args, item)
 
-        generator = _set_seed(args.seed)
-        pipe_kwargs = {
-            "intensity": data['intensity'],
-            "color": data['color'],
-            "num_inference_steps": 20, 
-            "generator": generator,
-            "image": data['controlnet_cond'],
-            "albedo_latents": albedo_latents_noisy.cuda(),
-            "prompt": item['prompt'] if args.version in ctx['COND_CONFIG']['prompt'] else None,
-        }
-        if ctx['use_ambient_cond']:
-            pipe_kwargs["ambient"] = data['ambient']
-
-        # 執行 Inference (Guided 或 Standard)
-        if args.guidance_scale > 0:
-            target_tensor = ctx['img_transform'](data['ori_pil']).unsqueeze(0)
-            images = guided_generation(ctx, pipe_kwargs, target_tensor, guidance_scale=args.guidance_scale)
-            image = images[0]
-        else:
-            pipe_output, _, _ = ctx['pipe'](**pipe_kwargs)
-            image = pipe_output.images[0]
-
+        # 計算四項品質指標
         s_score = _calculate_ssim(image, data['ori_pil'])
         n_score = _calculate_niqe(image)
+        b_score = _calculate_brisque(image)
+        l_score = _calculate_lpips(image, data['ori_pil'])
         
-        # 存檔
+        # 儲存結果與對照圖
         suffix = f"{idx}_{args.seed}"
-        if args.guidance_scale > 0: suffix += f"_gs{args.guidance_scale}"
+        if args.guidance_scale > 0:
+            suffix += f"_gs{args.guidance_scale}"
         
         image.save(f"{out_dir}/output_{suffix}.png")
         data['ori_pil'].save(f"{out_dir}/ori_{suffix}.png")
         data['target_pil'].save(f"{out_dir}/target_{suffix}.png")
         
-        print(f"  [Single] Processed {idx} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f} | Saved to {out_dir}")
+        print(f"[Single] ID {idx} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f} | BRISQUE: {b_score:.4f} | LPIPS: {l_score:.4f}")
+    print(f"Saved to: {out_dir}")
 
 # ==========================================
 # 3. [New] Multi-Condition Sweep (Colors & Intensities)
@@ -390,7 +371,6 @@ def run_single_inference(ctx, args, dataset, indices):
 def run_multicond_sweep(ctx, args, dataset, indices):
     print("--- Mode: Multi-Condition Sweep (Colors & Intensities) ---")
     
-    # 定義要測試的顏色 (RGB 0-255)
     COLORS = {
         "White": [255, 255, 255],
         "Red":   [255, 0, 0],
@@ -403,14 +383,12 @@ def run_multicond_sweep(ctx, args, dataset, indices):
         "Pink":   [255, 192, 203],
         "Magenta": [255, 0, 255]
     }
-    
-    # 定義要測試的強度
     INTENSITIES = [0.2, 0.5, 0.8, 1.0, 1.2, 1.5]
     
     out_dir = f'./inference/{args.version}/sweep_multicond'
     os.makedirs(out_dir, exist_ok=True)
     
-    for i, idx in enumerate(indices):
+    for idx in indices:
         item = dataset[idx]
         print(f"\nProcessing Image ID: {idx}")
         
@@ -420,55 +398,30 @@ def run_multicond_sweep(ctx, args, dataset, indices):
             data = _prepare_batch_data(ctx, item, args, idx, override_color=c_val, override_intensity=1.0)
             image = _run_inference_internal(ctx, data, args, item)
             
-            s_score = _calculate_ssim(image, data['ori_pil'])
-            n_score = _calculate_niqe(image)
+            s = _calculate_ssim(image, data['ori_pil'])
+            n = _calculate_niqe(image)
+            b = _calculate_brisque(image)
+            l = _calculate_lpips(image, data['ori_pil'])
             
-            fname = f"img{idx}_color_{c_name}_S{s_score:.3f}_N{n_score:.3f}.png"
+            fname = f"img{idx}_color_{c_name}.png"
             image.save(os.path.join(out_dir, fname))
-            print(f"    Saved {c_name} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f}")
+            print(f"    Saved {c_name} | SSIM: {s:.4f} | NIQE: {n:.4f} | BRISQUE: {b:.4f} | LPIPS: {l:.4f}")
 
-        # 2. 強度 Sweep (固定 Color = White)
+        # 2. 強度 Sweep (固定 Color = Red)
         print("  > Sweeping Intensities...")
         for ints in INTENSITIES:
-            data = _prepare_batch_data(ctx, item, args, idx, override_color=COLORS["White"], override_intensity=ints)
+            data = _prepare_batch_data(ctx, item, args, idx, override_color=COLORS["Red"], override_intensity=ints)
             image = _run_inference_internal(ctx, data, args, item)
             
-            s_score = _calculate_ssim(image, data['ori_pil'])
-            n_score = _calculate_niqe(image)
+            s = _calculate_ssim(image, data['ori_pil'])
+            n = _calculate_niqe(image)
+            b = _calculate_brisque(image)
+            l = _calculate_lpips(image, data['ori_pil'])
             
-            fname = f"img{idx}_intensity_{ints}_S{s_score:.3f}_N{n_score:.3f}.png"
+            fname = f"img{idx}_intensity_{ints}.png"
             image.save(os.path.join(out_dir, fname))
-            print(f"    Saved Intensity {ints} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f}")
+            print(f"    Saved Intensity {ints} | SSIM: {s:.4f} | NIQE: {n:.4f} | BRISQUE: {b:.4f} | LPIPS: {l:.4f}")
     print(f"\nSweep Completed. Results saved to {out_dir}")
-
-def _run_inference_internal(ctx, data, args, item):
-    """ 內部 Helper: 負責準備 Latents 並呼叫 Pipeline """
-    albedo_latents = ctx['vae'].encode(data['albedo'].to(dtype=torch.float32).cuda()).latent_dist.sample() * ctx['vae'].config.scaling_factor
-    albedo_noise = torch.randn_like(albedo_latents)
-    timesteps_albedo = torch.randint(200, 201, (1,))
-    albedo_latents_noisy = ctx['scheduler'].add_noise(albedo_latents, albedo_noise, timesteps_albedo)
-
-    generator = _set_seed(args.seed)
-    pipe_kwargs = {
-        "intensity": data['intensity'],
-        "color": data['color'],
-        "num_inference_steps": 20, 
-        "generator": generator,
-        "image": data['controlnet_cond'],
-        "albedo_latents": albedo_latents_noisy.cuda(),
-        "prompt": item['prompt'] if args.version in ctx['COND_CONFIG']['prompt'] else None,
-    }
-    if ctx['use_ambient_cond']:
-        pipe_kwargs["ambient"] = data['ambient']
-
-    if args.guidance_scale > 0:
-        target_tensor = ctx['img_transform'](data['ori_pil']).unsqueeze(0)
-        images = guided_generation(ctx, pipe_kwargs, target_tensor, guidance_scale=args.guidance_scale)
-        return images[0]
-    else:
-        pipe_output, _, _ = ctx['pipe'](**pipe_kwargs)
-        return pipe_output.images[0]
-
 
 # ==========================================
 # 4. Benchmark 模式 (Top 1% SSIM -> NIQE)
@@ -490,8 +443,7 @@ def run_benchmark_inference(ctx, args, dataset, indices):
     # Python 的 heapq 是 Min-Heap，所以會踢掉 (SSIM 最小) 或 (SSIM 相同但 -NIQE 最小即 NIQE 最大) 的元素
     top_k_heap = [] 
     
-    total_ssim = 0.0
-    total_niqe = 0.0
+    total_metrics = {"ssim": 0.0, "niqe": 0.0, "brisque": 0.0, "lpips": 0.0}
     count = 0
 
     pbar = tqdm(indices, desc="Benchmarking")
@@ -503,9 +455,13 @@ def run_benchmark_inference(ctx, args, dataset, indices):
 
         s_score = _calculate_ssim(image, data['ori_pil'])
         n_score = _calculate_niqe(image)
+        b_score = _calculate_brisque(image)
+        l_score = _calculate_lpips(image, data['ori_pil'])
         
-        total_ssim += s_score
-        total_niqe += n_score
+        total_metrics["ssim"] += s_score
+        total_metrics["niqe"] += n_score
+        total_metrics["brisque"] += b_score
+        total_metrics["lpips"] += l_score
         count += 1
 
         # --- 動態篩選邏輯 ---
@@ -520,12 +476,8 @@ def run_benchmark_inference(ctx, args, dataset, indices):
                 heapq.heapreplace(top_k_heap, current_entry)
         
         # 更新進度條顯示當前 1% 的門檻
-        pbar.set_postfix({
-            "Avg_S": f"{total_ssim/count:.3f}", 
-            "Cut_S": f"{top_k_heap[0][0]:.3f}",
-            "Cut_N": f"{-top_k_heap[0][1]:.3f}"
-        })
-
+        pbar.set_postfix({"Avg_S": f"{total_metrics['ssim']/count:.3f}", "Cutoff_S": f"{top_k_heap[0][0]:.3f}"})
+        
     # --- 最終排序與寫入 CSV ---
     # 依照 SSIM 降序，NIQE 升序
     top_results = sorted(top_k_heap, key=lambda x: (x[0], -x[1]), reverse=True)
@@ -533,30 +485,32 @@ def run_benchmark_inference(ctx, args, dataset, indices):
     csv_path = os.path.join(out_dir, "top_1_percent_rankings.csv")
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['Rank', 'Image_ID', 'SSIM_Score', 'NIQE_Score'])
-        for rank, (s, neg_n, res_idx, _, _) in enumerate(top_results, 1):
-            writer.writerow([rank, res_idx, f"{s:.5f}", f"{-neg_n:.5f}"])
+        writer.writerow(['Rank', 'Image_ID', 'SSIM_Score', 'NIQE_Score', 'BRISQUE_Score', 'LPIPS_Score'])
+        for rank, (s, neg_n, b, l, res_idx, _, _) in enumerate(top_results, 1):
+            writer.writerow([rank, res_idx, f"{s:.5f}", f"{-neg_n:.5f}", f"{b:.5f}", f"{l:.5f}"])
 
     print(f"\n" + "="*40)
-    print(f"Benchmark Finished.")
-    print(f"Global Average SSIM: {total_ssim/count:.5f}")
-    print(f"Global Average NIQE: {total_niqe/count:.5f}")
-    print(f"Top 1% Results saved to: {csv_path}")
+    print(f"Benchmark Finished (Total processed: {count})")
+    print(f"Average SSIM:    {total_metrics['ssim']/count:.5f}")
+    print(f"Average NIQE:    {total_metrics['niqe']/count:.5f}")
+    print(f"Average BRISQUE: {total_metrics['brisque']/count:.5f}")
+    print(f"Average LPIPS:   {total_metrics['lpips']/count:.5f}")
     print("="*40)
 
     # 建立 Dataset 存檔 (僅存 Top 1%)
-    data_dict = {"index": [], "ssim": [], "niqe": [], "image": [], "target": []}
-    for s, neg_n, res_idx, img, tgt in top_results:
+    data_dict = {"index": [], "ssim": [], "niqe": [], "brisque": [], "lpips": [], "image": [], "target": []}
+    for s, neg_n, b, l, res_idx, img, tgt in top_results:
         data_dict["index"].append(res_idx)
         data_dict["ssim"].append(s)
         data_dict["niqe"].append(-neg_n)
+        data_dict["brisque"].append(b)
+        data_dict["lpips"].append(l)
         data_dict["image"].append(img)
         data_dict["target"].append(tgt)
 
     hf_ds = Dataset.from_dict(data_dict)
-    save_path = os.path.join(out_dir, "top_1percent_dataset")
-    hf_ds.save_to_disk(save_path)
-    print(f"Full Top 1% Dataset saved to: {save_path}")
+    hf_ds.save_to_disk(os.path.join(out_dir, "top_1percent_dataset"))
+    print(f"Benchmark Done. CSV and Dataset saved to {out_dir}")
 
 # ==========================================
 # Helper Functions
@@ -594,6 +548,20 @@ def _calculate_niqe(img_pil):
             niqe_val = niqe_metric(img_tensor).item()
     return niqe_val
 
+def _calculate_brisque(img_pil):
+    img_tensor = transforms.ToTensor()(img_pil).unsqueeze(0).to('cuda')
+    with torch.no_grad():
+        return brisque_metric(img_tensor).item()
+    
+def _calculate_lpips(img1, img2):
+    """計算感知相似度，使用 ori_pil 作為基準"""
+    if img1.size != img2.size:
+        img2 = img2.resize(img1.size, Image.BILINEAR)
+    t1 = transforms.ToTensor()(img1).unsqueeze(0).to('cuda')
+    t2 = transforms.ToTensor()(img2).unsqueeze(0).to('cuda')
+    with torch.no_grad():
+        return lpips_metric(t1, t2).item()
+
 def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_intensity=None):
     """
     資料準備函數
@@ -619,7 +587,7 @@ def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_inte
         # override_color 預期是 list/tuple [R,G,B] 0-255
         color = torch.tensor([c/255.0 for c in override_color], dtype=torch.float32)
     else:
-        color = torch.tensor([0, 1.0, 0], dtype=torch.float32) # Default Blue
+        color = torch.tensor([0, 1.0, 0], dtype=torch.float32) # Default Green
 
     manual_ambient = 0.75
 
@@ -710,6 +678,34 @@ def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_inte
         "ambient": torch.tensor([ambient_val]).float().unsqueeze(0),
         "controlnet_cond": cn_cond
     }
+    
+def _run_inference_internal(ctx, data, args, item):
+    """ 內部 Helper: 負責準備 Latents 並呼叫 Pipeline """
+    albedo_latents = ctx['vae'].encode(data['albedo'].to(dtype=torch.float32).cuda()).latent_dist.sample() * ctx['vae'].config.scaling_factor
+    albedo_noise = torch.randn_like(albedo_latents)
+    timesteps_albedo = torch.randint(200, 201, (1,))
+    albedo_latents_noisy = ctx['scheduler'].add_noise(albedo_latents, albedo_noise, timesteps_albedo)
+
+    generator = _set_seed(args.seed)
+    pipe_kwargs = {
+        "intensity": data['intensity'],
+        "color": data['color'],
+        "num_inference_steps": 20, 
+        "generator": generator,
+        "image": data['controlnet_cond'],
+        "albedo_latents": albedo_latents_noisy.cuda(),
+        "prompt": item['prompt'] if args.version in ctx['COND_CONFIG']['prompt'] else None,
+    }
+    if ctx['use_ambient_cond']:
+        pipe_kwargs["ambient"] = data['ambient']
+
+    if args.guidance_scale > 0:
+        target_tensor = ctx['img_transform'](data['ori_pil']).unsqueeze(0)
+        images = guided_generation(ctx, pipe_kwargs, target_tensor, guidance_scale=args.guidance_scale)
+        return images[0]
+    else:
+        pipe_output, _, _ = ctx['pipe'](**pipe_kwargs)
+        return pipe_output.images[0]
 
 
 # ==========================================
