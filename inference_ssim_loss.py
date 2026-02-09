@@ -20,6 +20,8 @@ from skimage.metrics import structural_similarity as ssim
 # Custom Imports
 from network_controlnet import ControlNetModel
 from datasets import load_dataset, Image as HfImage, Dataset
+import pyiqa
+niqe_metric = pyiqa.create_metric('niqe', device=torch.device('cuda'))
 
 # Relighting API Imports
 import physical_relighting_api_v2 as relighting_api_v2
@@ -368,7 +370,8 @@ def run_single_inference(ctx, args, dataset, indices):
             pipe_output, _, _ = ctx['pipe'](**pipe_kwargs)
             image = pipe_output.images[0]
 
-        ssim_score = _calculate_ssim(image, data['ori_pil'])
+        s_score = _calculate_ssim(image, data['ori_pil'])
+        n_score = _calculate_niqe(image)
         
         # 存檔
         suffix = f"{idx}_{args.seed}"
@@ -378,7 +381,7 @@ def run_single_inference(ctx, args, dataset, indices):
         data['ori_pil'].save(f"{out_dir}/ori_{suffix}.png")
         data['target_pil'].save(f"{out_dir}/target_{suffix}.png")
         
-        print(f"  [Single] Processed {idx} | SSIM: {ssim_score:.4f} | Saved to {out_dir}")
+        print(f"  [Single] Processed {idx} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f} | Saved to {out_dir}")
 
 # ==========================================
 # 3. [New] Multi-Condition Sweep (Colors & Intensities)
@@ -414,26 +417,28 @@ def run_multicond_sweep(ctx, args, dataset, indices):
         # 1. 顏色 Sweep (固定 Intensity = 1.0)
         print("  > Sweeping Colors...")
         for c_name, c_val in COLORS.items():
-            # 使用 _prepare_batch_data 覆寫顏色，確保 ControlNet Lightmap 重算
             data = _prepare_batch_data(ctx, item, args, idx, override_color=c_val, override_intensity=1.0)
-            
             image = _run_inference_internal(ctx, data, args, item)
             
-            fname = f"img{idx}_color_{c_name}.png"
+            s_score = _calculate_ssim(image, data['ori_pil'])
+            n_score = _calculate_niqe(image)
+            
+            fname = f"img{idx}_color_{c_name}_S{s_score:.3f}_N{n_score:.3f}.png"
             image.save(os.path.join(out_dir, fname))
-            print(f"    Saved {fname}")
+            print(f"    Saved {c_name} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f}")
 
         # 2. 強度 Sweep (固定 Color = White)
         print("  > Sweeping Intensities...")
         for ints in INTENSITIES:
             data = _prepare_batch_data(ctx, item, args, idx, override_color=COLORS["White"], override_intensity=ints)
-            
             image = _run_inference_internal(ctx, data, args, item)
             
-            fname = f"img{idx}_intensity_{ints}.png"
-            image.save(os.path.join(out_dir, fname))
-            print(f"    Saved {fname}")
+            s_score = _calculate_ssim(image, data['ori_pil'])
+            n_score = _calculate_niqe(image)
             
+            fname = f"img{idx}_intensity_{ints}_S{s_score:.3f}_N{n_score:.3f}.png"
+            image.save(os.path.join(out_dir, fname))
+            print(f"    Saved Intensity {ints} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f}")
     print(f"\nSweep Completed. Results saved to {out_dir}")
 
 def _run_inference_internal(ctx, data, args, item):
@@ -466,76 +471,85 @@ def _run_inference_internal(ctx, data, args, item):
 
 
 # ==========================================
-# 4. Benchmark 模式 (Top 1% SSIM)
+# 4. Benchmark 模式 (Top 1% SSIM -> NIQE)
 # 說明：
 #   跑大量數據，不儲存中間圖片與 JSON。
 #   採用「一邊生成一邊篩選」的 Min-Heap 策略，最後才對 Top 1% 進行排序並存成 CSV。
 # ==========================================
 def run_benchmark_inference(ctx, args, dataset, indices):
-    print(f"\n=== Benchmark Mode ===")
-    print(f"Total Images: {len(indices)}")
+    print(f"\n=== Benchmark Mode (Top 1% Selection) ===")
+    print(f"Total Images to process: {len(indices)}")
     
-    # 計算 Top 1% 需要保留的數量
+    # 計算 Top 1% 數量
     top_k_count = max(1, int(len(indices) * 0.01))
-    print(f"Goal: Track Top {top_k_count} best images (Top 1%).")
-
     out_dir = f'./inference/{args.version}/benchmark'
     os.makedirs(out_dir, exist_ok=True)
 
-    # 初始化 Min-Heap (用來維持 Top K)
-    # 格式: (ssim, idx, image_pil, target_pil)
-    # 因為是 Min-Heap，heap[0] 永遠是這 K 個裡面分數最低的 (門檻值)
+    # Min-Heap 用於動態篩選 Top 1%
+    # 存放格式: (ssim, -niqe, idx, image_pil, target_pil)
+    # Python 的 heapq 是 Min-Heap，所以會踢掉 (SSIM 最小) 或 (SSIM 相同但 -NIQE 最小即 NIQE 最大) 的元素
     top_k_heap = [] 
-    total_ssim = 0.0
-    processed_count = 0
     
+    total_ssim = 0.0
+    total_niqe = 0.0
+    count = 0
+
     pbar = tqdm(indices, desc="Benchmarking")
     for idx in pbar:
         item = dataset[idx]
-        # _prepare_batch_data 內部已加入靜音邏輯，不存 debug 圖
+        # Benchmark 模式下不儲存 debug 中間圖
         data = _prepare_batch_data(ctx, item, args, idx)
-        
-        # 執行推理 (不存圖)
         image = _run_inference_internal(ctx, data, args, item)
 
-        score = _calculate_ssim(image, data['ori_pil'])
-        total_ssim += score
-        processed_count += 1
+        s_score = _calculate_ssim(image, data['ori_pil'])
+        n_score = _calculate_niqe(image)
         
-        # --- 一邊生成一邊篩選 Top 1% ---
-        if len(top_k_heap) < top_k_count:
-            heapq.heappush(top_k_heap, (score, idx, image, data['ori_pil']))
-        else:
-            # 如果 Heap 滿了，且當前分數大於堆積中的最小值，則進行替換
-            if score > top_k_heap[0][0]:
-                heapq.heapreplace(top_k_heap, (score, idx, image, data['ori_pil']))
-        
-        # 更新進度條顯示當前 1% 的門檻分數
-        min_top_score = top_k_heap[0][0] if top_k_heap else 0.0
-        pbar.set_postfix({"Avg": f"{total_ssim/processed_count:.3f}", "Cutoff": f"{min_top_score:.3f}"})
+        total_ssim += s_score
+        total_niqe += n_score
+        count += 1
 
-    # --- 最後排序與寫入 CSV ---
-    # 對堆積中的結果進行最終由高到低的排序
-    top_results = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
+        # --- 動態篩選邏輯 ---
+        # 使用 -n_score 是為了讓 NIQE 越小的人在 tuple 比較中顯得越大
+        current_entry = (s_score, -n_score, idx, image, data['ori_pil'])
+        
+        if len(top_k_heap) < top_k_count:
+            heapq.heappush(top_k_heap, current_entry)
+        else:
+            # 如果當前這張圖比 Heap 裡面最爛的那張 (heap[0]) 還好，就替換掉
+            if (s_score, -n_score) > (top_k_heap[0][0], top_k_heap[0][1]):
+                heapq.heapreplace(top_k_heap, current_entry)
+        
+        # 更新進度條顯示當前 1% 的門檻
+        pbar.set_postfix({
+            "Avg_S": f"{total_ssim/count:.3f}", 
+            "Cut_S": f"{top_k_heap[0][0]:.3f}",
+            "Cut_N": f"{-top_k_heap[0][1]:.3f}"
+        })
+
+    # --- 最終排序與寫入 CSV ---
+    # 依照 SSIM 降序，NIQE 升序
+    top_results = sorted(top_k_heap, key=lambda x: (x[0], -x[1]), reverse=True)
     
     csv_path = os.path.join(out_dir, "top_1_percent_rankings.csv")
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['Rank', 'Image_ID', 'SSIM_Score'])
-        for rank, (score, res_idx, _, _) in enumerate(top_results, 1):
-            writer.writerow([rank, res_idx, f"{score:.5f}"])
+        writer.writerow(['Rank', 'Image_ID', 'SSIM_Score', 'NIQE_Score'])
+        for rank, (s, neg_n, res_idx, _, _) in enumerate(top_results, 1):
+            writer.writerow([rank, res_idx, f"{s:.5f}", f"{-neg_n:.5f}"])
 
-    print("\n" + "="*40)
-    print(f"Benchmark Report (Saved to {csv_path})")
-    print(f"Average SSIM:    {total_ssim / processed_count:.5f}")
-    print(f"Top 1% Cutoff:   {top_results[-1][0]:.5f}")
+    print(f"\n" + "="*40)
+    print(f"Benchmark Finished.")
+    print(f"Global Average SSIM: {total_ssim/count:.5f}")
+    print(f"Global Average NIQE: {total_niqe/count:.5f}")
+    print(f"Top 1% Results saved to: {csv_path}")
     print("="*40)
-    
-    # 建立 Dataset 存檔
-    data_dict = {"index": [], "ssim": [], "image": [], "target": []}
-    for score, res_idx, img, tgt in top_results:
+
+    # 建立 Dataset 存檔 (僅存 Top 1%)
+    data_dict = {"index": [], "ssim": [], "niqe": [], "image": [], "target": []}
+    for s, neg_n, res_idx, img, tgt in top_results:
         data_dict["index"].append(res_idx)
-        data_dict["ssim"].append(score)
+        data_dict["ssim"].append(s)
+        data_dict["niqe"].append(-neg_n)
         data_dict["image"].append(img)
         data_dict["target"].append(tgt)
 
@@ -569,6 +583,16 @@ def _calculate_ssim(img1, img2):
     arr1 = np.array(img1.convert('L'))
     arr2 = np.array(img2.convert('L'))
     return ssim(arr1, arr2, data_range=255)
+
+def _calculate_niqe(img_pil):
+    """計算單張圖片的 NIQE (越低越自然)"""
+    niqe_val = 0.0
+    if niqe_metric is not None:
+        # 將 PIL 轉為 Tensor (範圍 0~1) 並搬到 GPU
+        img_tensor = transforms.ToTensor()(img_pil).unsqueeze(0).to('cuda')
+        with torch.no_grad():
+            niqe_val = niqe_metric(img_tensor).item()
+    return niqe_val
 
 def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_intensity=None):
     """
