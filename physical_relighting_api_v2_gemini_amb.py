@@ -677,7 +677,8 @@ def compute_relighting(phys_cfg: PhysicalRelightingConfig, manual_ambient: Optio
     return {
         'image': tensor_to_pil(relit),                # Relit 結果
         'lightmap': tensor_gray_to_pil(light_total_gray), # 灰階 (Total)
-        'lightmap_raw': tensor_gray_to_pil(shading_gray_accum.clamp(0, 1)),
+        'lightmap_raw': tensor_gray_to_pil(shading_gray_accum.clamp(0, 1)), # 灰階 (純燈光，無環境光)
+        'lightmap_raw_rgb': tensor_to_pil(light_rgb.clamp(0, 1)),   # RGB (純燈光，無環境光)
         'lightmap_rgb': tensor_to_pil(light_total_rgb), # RGB (Total)
         'ambient': final_ambient                      # Ambient 數值
     }

@@ -75,7 +75,9 @@ class Indoor_dataset(Dataset):
         # === 6. 讀取 ControlNet 設定 ===
         # 預設為 True (推薦)，即使用 RGB Lightmap
         self.use_ambient_in_controlnet = cfg.get('use_ambient_in_controlnet', True)
+        self.use_color_on_lightmap = cfg.get('use_color_on_lightmap', False)
         print(f"ControlNet uses Ambient in Lightmap: {self.use_ambient_in_controlnet}")
+        print(f"ControlNet lightmap uses Color:   {self.use_color_on_lightmap}")
         
     def __len__(self):
         return len(self.ds)
@@ -107,16 +109,31 @@ class Indoor_dataset(Dataset):
                 ambient_scalar = getattr(config, 'ambient', 0.75) # 預設值
             
             # 根據 Config 選擇 ControlNet 的 Lightmap
+            # 邏輯矩陣:
+            # | Ambient | Color | 選用的 Key          |
+            # |---------|-------|---------------------|
+            # | True    | True  | lightmap_rgb        |
+            # | True    | False | lightmap (Gray)     |
+            # | False   | True  | lightmap_raw_rgb    |
+            # | False   | False | lightmap_raw (Gray) |
             if self.use_ambient_in_controlnet:
-                # Case A: 使用「含 Ambient」的 (灰底)
-                # 對應 config: true
-                lightmap = result['lightmap'].convert('RGB')
+                # Case A: 使用含 Ambient 的 (灰底)
+                if self.use_color_on_lightmap:
+                    # 嘗試拿彩色版，沒有則退回灰階版
+                    source = result.get('lightmap_rgb', result['lightmap'])
+                else:
+                    # 強制拿灰階版
+                    source = result['lightmap']
             else:
-                # Case B: 使用「不含 Ambient」的 (黑底)
-                # 對應 config: false (推薦)
-                # 使用 .get() 做 fallback，防止舊版 API 沒有 lightmap_raw 報錯
-                lightmap = result.get('lightmap_raw', result['lightmap']).convert('RGB')
-            
+                # Case B: 使用不含 Ambient 的 (黑底)
+                if self.use_color_on_lightmap:
+                    # 嘗試拿彩色版 (需要 API 支援 lightmap_raw_rgb)
+                    # 如果 API 沒傳這個 key，就會退回 lightmap_raw (黑白) -> 避免報錯
+                    source = result.get('lightmap_raw_rgb', result.get('lightmap_raw', result['lightmap']))
+                else:
+                    # 強制拿灰階版
+                    source = result.get('lightmap_raw', result['lightmap'])
+            lightmap = source.convert('RGB')
             
             # Transforms
             normal_tensor = self.conditioning_image_transforms(normal)

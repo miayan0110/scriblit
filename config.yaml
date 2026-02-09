@@ -1,6 +1,6 @@
 experiment:
   project_name: "relighting_indoors"
-  output_dir: "train_ex9_1"
+  output_dir: "train_ex11"
   logging_dir: "logs"
   report_to: "tensorboard"
 
@@ -40,7 +40,7 @@ data:
   dataset_cache_dir: "/mnt/HDD3/miayan/paper/relighting_datasets/" 
   data_hf_repo_id: "Miayan/physical-relighting-dataset"
   data_split: "test"
-  resolution: 768 
+  resolution: 512 
   dataloader_num_workers: 0
   condition_mode: "lightmap_normal" # "lightmap_normal" or "depth_mask_normal"
 
@@ -51,9 +51,15 @@ data:
   relighting_impl: "gemini_amb"
 
   # === [新增] ControlNet 輸入選擇 ===
+  # 1. 是否包含環境光 (Ambient)
   # true: 使用含 Ambient 的 Lightmap (灰底，對比低) -> 導致結果變淡
   # false: 使用不含 Ambient 的 Lightmap (黑底，對比高) -> 推薦！影子較深
-  use_ambient_in_controlnet: true
+  use_ambient_in_controlnet: false
+
+  # 2. [新增] 是否包含顏色 (Color)
+  # true: ControlNet 看到彩色的光 (能解決色偏) -> 推薦！
+  # false: ControlNet 看到黑白的光 (容易依賴 Encoder 導致色偏)
+  use_color_on_lightmap: true
 
   colors:
     - [255, 255, 255] # white
@@ -79,7 +85,7 @@ training:
   allow_tf32: true
   gradient_accumulation_steps: 1
   checkpointing_steps: 5000
-  checkpoints_total_limit: 5
+  checkpoints_total_limit: 3
 
   # Optimizer
   learning_rate: 5.0e-6 # 5.0e-6/2.0e-5

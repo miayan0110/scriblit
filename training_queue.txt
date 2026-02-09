@@ -1,0 +1,2 @@
+/mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex11|checkpoint-235260
+/mnt/HDD3/miayan/paper/scriblit/config.yaml|train_ex11_1|checkpoint-235260

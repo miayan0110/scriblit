@@ -9,7 +9,8 @@ experiments = natsorted([ex for ex in os.listdir(base_dir) if ex.startswith("tra
 print("Found experiments:", experiments)
 exclude_exp = ["train_ex8_8_bs32",
                "train_ex8_7_bs32",
-               "train_ex8_12"]
+               "train_ex9_1",
+               "train_ex8_11",]
 
 for exp in experiments:
     if exp in exclude_exp:
