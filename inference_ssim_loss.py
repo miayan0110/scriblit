@@ -372,18 +372,17 @@ def run_multicond_sweep(ctx, args, dataset, indices):
     print("--- Mode: Multi-Condition Sweep (Colors & Intensities) ---")
     
     COLORS = {
-        "White": [255, 255, 255],
         "Red":   [255, 0, 0],
-        "Green": [0, 255, 0],
-        "Blue":  [0, 0, 255],
         "Yellow":  [255, 255, 0],
-        "Orange":  [255, 165, 0],
-        "Purple":  [128, 0, 128],
+        "Green": [0, 255, 0],
         "Cyan":    [0, 255, 255],
-        "Pink":   [255, 192, 203],
-        "Magenta": [255, 0, 255]
+        "Blue":  [0, 0, 255],
+        "Magenta": [255, 0, 255],
+        # "Orange":  [255, 165, 0],
+        # "Purple":  [128, 0, 128],
+        # "Pink":   [255, 192, 203],
     }
-    INTENSITIES = [0.2, 0.5, 0.8, 1.0, 1.2, 1.5]
+    INTENSITIES = [0.0, 0.1, 0.2, 0.4, 0.7, 1.0]
     
     out_dir = f'./inference/{args.version}/sweep_multicond'
     os.makedirs(out_dir, exist_ok=True)
