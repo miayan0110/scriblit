@@ -683,14 +683,14 @@ def _run_inference_internal(ctx, data, args, item):
     """ 內部 Helper: 負責準備 Latents 並呼叫 Pipeline """
     albedo_latents = ctx['vae'].encode(data['albedo'].to(dtype=torch.float32).cuda()).latent_dist.sample() * ctx['vae'].config.scaling_factor
     albedo_noise = torch.randn_like(albedo_latents)
-    timesteps_albedo = torch.randint(200, 201, (1,))
+    timesteps_albedo = torch.randint(50, 51, (1,))  # 50/200
     albedo_latents_noisy = ctx['scheduler'].add_noise(albedo_latents, albedo_noise, timesteps_albedo)
 
     generator = _set_seed(args.seed)
     pipe_kwargs = {
         "intensity": data['intensity'],
         "color": data['color'],
-        "num_inference_steps": 20, 
+        "num_inference_steps": 50, # 50/20
         "generator": generator,
         "image": data['controlnet_cond'],
         "albedo_latents": albedo_latents_noisy.cuda(),
@@ -750,7 +750,7 @@ if __name__ == "__main__":
             '/mnt/HDD3/miayan/paper/scriblit/eval_data/images_flatten/mask/2_0.png',
             '/mnt/HDD3/miayan/paper/scriblit/eval_data/images_flatten/mask/3_0.png'
         ]
-        indices = ids[:args.data+1]
+        indices = ids[:args.data]
         
         mapped_dataset = []
         for i, idx in enumerate(indices):
@@ -765,7 +765,7 @@ if __name__ == "__main__":
             limit = min(args.data, len(ds))
             indices = range(limit)
         else:
-            indices = range(args.data + 1)
+            indices = range(args.data)
         dataset_to_use = ds
 
     # 3. Dispatch Task
