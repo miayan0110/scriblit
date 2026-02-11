@@ -38,7 +38,7 @@ def _calculate_brisque(img_pil):
 # ==========================================
 def run_quality_check(args, dataset, indices):
     print(f"--- [Quality Check] Mode: {args.mode} ---")
-    out_dir = f'./inference/quality_report/{args.mode}'
+    out_dir = f'./inference/quality_report/{args.mode}_{args.key}'
     os.makedirs(out_dir, exist_ok=True)
 
     results = []
@@ -50,7 +50,7 @@ def run_quality_check(args, dataset, indices):
     for idx in pbar:
         item = dataset[idx]
         # 取得影像 (對齊你原本 Dataset 的 key 'image')
-        img_pil = item['image'].convert('RGB').resize((512, 512))
+        img_pil = item[args.key].convert('RGB').resize((512, 512))
 
         # 計算指標
         n_score = _calculate_niqe(img_pil)
@@ -89,6 +89,7 @@ def run_quality_check(args, dataset, indices):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-mode', '--mode', type=str, default='standard', choices=['standard', 'lightlab'])
+    parser.add_argument('-key', '--key', type=str, default='image', choices=['image', 'pseudo_gt'])
     parser.add_argument('-data', '--num_data', type=int, default=100, help="要計算的資料數量")
     args = parser.parse_args()
 
