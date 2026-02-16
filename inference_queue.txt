@@ -1,3 +1,0 @@
-CUDA_VISIBLE_DEVICES=0 python inference_ssim_loss.py --version train_ex8_10 --data 3 --task single --mode standard --guidance_scale 1500
-CUDA_VISIBLE_DEVICES=0 python inference_ssim_loss.py --version train_ex8_10 --data 3 --task multicond --mode standard --guidance_scale 1500
-CUDA_VISIBLE_DEVICES=0 python inference_ssim_loss.py --version train_ex8_10 --data 10000 --task benchmark --mode standard --guidance_scale 1500

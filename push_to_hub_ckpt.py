@@ -7,10 +7,8 @@ repo_id = "Miayan/project"
 base_dir = "/mnt/HDD3/miayan/paper/scriblit"
 experiments = natsorted([ex for ex in os.listdir(base_dir) if ex.startswith("train_ex")])
 print("Found experiments:", experiments)
-exclude_exp = ["train_ex8_8_bs32",
-               "train_ex8_7_bs32",
-               "train_ex9_1",
-               "train_ex8_11",]
+exclude_exp = ["train_ex11-allLoss",
+               "train_ex11-mask",]
 
 for exp in experiments:
     if exp in exclude_exp:

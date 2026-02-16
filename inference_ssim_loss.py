@@ -16,6 +16,9 @@ from huggingface_hub import snapshot_download
 from natsort import natsorted
 from omegaconf import OmegaConf
 from skimage.metrics import structural_similarity as ssim
+from skimage import color as skcolor
+from scipy.stats import spearmanr, pearsonr
+import matplotlib.pyplot as plt
 
 # Custom Imports
 from network_controlnet import ControlNetModel
@@ -35,6 +38,96 @@ from light_cond_encoder import CustomEncoder as CustomEncoderV1
 from light_cond_encoder_amb import CustomEncoder as CustomEncoderAmb
 from albedo_estimator import AlbedoWrapper
 
+
+# ==========================================
+# [New Class] Control Metrics (IM & CA)
+# 說明：用於量化強度與顏色控制的準確性
+# ==========================================
+class RelightingControlMetrics:
+    def __init__(self, eps=1e-8, resolution=512):
+        self.eps = eps
+        self.luma_weights = torch.tensor([0.2126, 0.7152, 0.0722])
+        self.resizer = transforms.Resize((resolution, resolution))
+
+    def get_weighted_average(self, img_tensor, weight_mask=None):
+        """
+        If weight_mask is None: return global average.
+        Else: return weighted average (original behavior).
+        """
+        if weight_mask is None:
+            # img_tensor can be (H,W) or (C,H,W)
+            return img_tensor.mean(dim=(-2, -1)) if img_tensor.ndim == 3 else img_tensor.mean()
+
+        device = img_tensor.device
+        mask = weight_mask.to(device)
+
+        # 解析度對齊：確保 mask 與 img_tensor 尺寸一致
+        if img_tensor.shape[-2:] != mask.shape[-2:]:
+            mask = F.interpolate(
+                mask.unsqueeze(0).unsqueeze(0),
+                size=img_tensor.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            ).squeeze()
+
+        if img_tensor.ndim == 3:
+            mask = mask.unsqueeze(0) if mask.ndim == 2 else mask
+
+        weighted_sum = torch.sum(img_tensor * mask, dim=(-2, -1))
+        weight_total = torch.sum(mask) + self.eps
+        return weighted_sum / weight_total
+
+    def get_chromaticity_vector(self, img_pil, weight_mask=None):
+         # 確保輸入影像解析度一致（沿用你原本 resizer）
+        img_resized = self.resizer(img_pil)
+
+        # 轉 numpy RGB [0,1]
+        rgb = np.asarray(img_resized).astype(np.float32) / 255.0  # (H,W,3), RGB
+        # 轉 Lab
+        lab = skcolor.rgb2lab(rgb)  # (H,W,3), L in [0,100], a,b ~ [-128,127]
+        ab = lab[:, :, 1:3]         # (H,W,2)
+
+        # 轉 torch tensor
+        device = weight_mask.device if weight_mask is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        ab_t = torch.from_numpy(ab).to(device)  # (H,W,2)
+
+        # 若不用 mask：整張圖平均
+        if weight_mask is None:
+            mean_ab = ab_t.mean(dim=(0, 1))  # (2,)
+            return mean_ab
+
+        # 若有 mask：做加權平均（保留你原本能力）
+        mask = weight_mask.to(device)
+        # 對齊尺寸
+        if mask.shape[-2:] != ab_t.shape[:2]:
+            mask = F.interpolate(
+                mask.unsqueeze(0).unsqueeze(0),
+                size=ab_t.shape[:2],
+                mode='bilinear',
+                align_corners=False
+            ).squeeze()
+
+        w = mask.unsqueeze(-1)  # (H,W,1)
+        weighted_sum = (ab_t * w).sum(dim=(0, 1))         # (2,)
+        weight_total = w.sum() + self.eps
+        return weighted_sum / weight_total
+
+    def calculate_ca(self, delta_p_list, target_p_list):
+        scores = []
+        for dp, pt in zip(delta_p_list, target_p_list):
+            if torch.norm(dp) < 1e-6:
+                scores.append(0.0)
+                continue
+            cos_sim = F.cosine_similarity(dp.unsqueeze(0), pt.unsqueeze(0), eps=self.eps)
+            scores.append(cos_sim.item())
+        return np.mean(scores) if scores else 0.0
+
+    def calculate_im(self, alpha_list, luma_list):
+        if len(alpha_list) < 2:
+            return 0.0, 0.0
+        spearman_corr, _ = spearmanr(alpha_list, luma_list)
+        pearson_corr, _ = pearsonr(alpha_list, luma_list)
+        return float(spearman_corr), float(pearson_corr)
 
 # ==========================================
 # [Class] Differentiable SSIM for Guidance
@@ -369,57 +462,106 @@ def run_single_inference(ctx, args, dataset, indices):
 # 說明：針對同一張圖，自動測試多種顏色與光強，並確保 ControlNet Condition 也跟著改變。
 # ==========================================
 def run_multicond_sweep(ctx, args, dataset, indices):
-    print("--- Mode: Multi-Condition Sweep (Colors & Intensities) ---")
+    print("--- Mode: Multi-Condition Sweep (All Metrics Enabled) ---")
+    
+    control_tool = RelightingControlMetrics(resolution=ctx['resolution'])
     
     COLORS = {
-        "Red":   [255, 0, 0],
-        "Yellow":  [255, 255, 0],
-        "Green": [0, 255, 0],
-        "Cyan":    [0, 255, 255],
-        "Blue":  [0, 0, 255],
-        "Magenta": [255, 0, 255],
+        "Red": [255, 0, 0], "Yellow": [255, 255, 0], "Green": [0, 255, 0],
+        "Cyan": [0, 255, 255], "Blue": [0, 0, 255], "Magenta": [255, 0, 255],
         # "Orange":  [255, 165, 0],
         # "Purple":  [128, 0, 128],
         # "Pink":   [255, 192, 203],
     }
-    INTENSITIES = [0.0, 0.1, 0.2, 0.4, 0.7, 1.0]
+    INTENSITIES = [0.1, 0.2, 0.4, 0.7, 1.0] # 拿掉0.0
     
     out_dir = f'./inference/{args.version}/sweep_multicond'
     os.makedirs(out_dir, exist_ok=True)
     
     for idx in indices:
         item = dataset[idx]
-        print(f"\nProcessing Image ID: {idx}")
+        print(f"\n" + "="*50 + f"\nProcessing Image ID: {idx}\n" + "="*50)
         
-        # 1. 顏色 Sweep (固定 Intensity = 1.0)
-        print("  > Sweeping Colors...")
+        # 1. 準備量測區域 (Lightmap Luma)        
+        # 色度基準
+        p_input = control_tool.get_chromaticity_vector(item['image'])
+
+        # --- 第一階段：Color Sweep (計算品質指標 + CA) ---
+        print("\n[Phase 1] Sweeping Colors...")
+        delta_p_list, target_p_list = [], []
+        
         for c_name, c_val in COLORS.items():
             data = _prepare_batch_data(ctx, item, args, idx, override_color=c_val, override_intensity=1.0)
             image = _run_inference_internal(ctx, data, args, item)
             
+            # (1) 原本的品質指標
             s = _calculate_ssim(image, data['ori_pil'])
             n = _calculate_niqe(image)
             b = _calculate_brisque(image)
             l = _calculate_lpips(image, data['ori_pil'])
             
-            fname = f"img{idx}_color_{c_name}.png"
-            image.save(os.path.join(out_dir, fname))
-            print(f"    Saved {c_name} | SSIM: {s:.4f} | NIQE: {n:.4f} | BRISQUE: {b:.4f} | LPIPS: {l:.4f}")
+            # (2) CA 指標相關紀錄
+            p_relit = control_tool.get_chromaticity_vector(image)
+            delta_p_list.append(p_relit - p_input)
+            c_t = torch.tensor(c_val, dtype=torch.float32) / 255.0  # (3,)
+            target_rgb = c_t.cpu().numpy().reshape(1, 1, 3).astype(np.float32)
+            target_lab = skcolor.rgb2lab(target_rgb)  # (1,1,3)
+            target_ab = torch.tensor(target_lab[0, 0, 1:3], dtype=torch.float32, device=p_input.device)  # (2,)
+            target_p_list.append(target_ab - p_input)
+            
+            ca_single = F.cosine_similarity((p_relit - p_input).unsqueeze(0), (target_ab - p_input).unsqueeze(0),).item()
 
-        # 2. 強度 Sweep (固定 Color = Red)
-        print("  > Sweeping Intensities...")
+            image.save(os.path.join(out_dir, f"img{idx}_color_{c_name}.png"))
+            print(f"    Color {c_name:8} | SSIM: {s:.4f} | NIQE: {n:.4f} | BRISQUE: {b:.4f} | LPIPS: {l:.4f} | CA: {ca_single:.4f}")
+
+        # 計算最終 CA
+        ca_score = control_tool.calculate_ca(delta_p_list, target_p_list)
+
+        # --- 第二階段：Intensity Sweep (計算品質指標 + IM) ---
+        print("\n[Phase 2] Sweeping Intensities...")
+        alpha_list, luma_list = [], []
+        luma_v_3d = control_tool.luma_weights.view(3, 1, 1).to('cuda')
+        
         for ints in INTENSITIES:
             data = _prepare_batch_data(ctx, item, args, idx, override_color=COLORS["Red"], override_intensity=ints)
             image = _run_inference_internal(ctx, data, args, item)
             
+            # (1) 原本的品質指標
             s = _calculate_ssim(image, data['ori_pil'])
             n = _calculate_niqe(image)
             b = _calculate_brisque(image)
             l = _calculate_lpips(image, data['ori_pil'])
             
-            fname = f"img{idx}_intensity_{ints}.png"
-            image.save(os.path.join(out_dir, fname))
-            print(f"    Saved Intensity {ints} | SSIM: {s:.4f} | NIQE: {n:.4f} | BRISQUE: {b:.4f} | LPIPS: {l:.4f}")
+            # (2) IM 指標相關紀錄
+            img_t = transforms.ToTensor()(image).to('cuda')
+            luma_map = (img_t * luma_v_3d).sum(dim=0)
+            avg_luma = luma_map.mean()
+            alpha_list.append(ints)
+            luma_list.append(avg_luma.item())
+
+            image.save(os.path.join(out_dir, f"img{idx}_intensity_{ints}.png"))
+            print(f"    Intensity {ints:<4} | SSIM: {s:.4f} | NIQE: {n:.4f} | BRISQUE: {b:.4f} | LPIPS: {l:.4f}")
+
+        # 計算最終 IM
+        im_spearman, im_pearson = control_tool.calculate_im(alpha_list, luma_list)
+        
+        # 畫 intensity–luminance curve
+        plt.figure()
+        plt.plot(alpha_list, luma_list, marker='o')
+        plt.xlabel("Intensity (alpha)")
+        plt.ylabel("Mean luminance (Y)")
+        plt.title(f"Intensity Response Curve (Image {idx})")
+        plt.grid(True)
+        plt.savefig(os.path.join(out_dir, f"img{idx}_intensity_curve.png"), dpi=200)
+        plt.close()
+
+        # --- 最後總結列印 ---
+        print("\n" + "-"*30)
+        print(f"SUMMARY FOR IMAGE ID {idx}:")
+        print(f"  > Color Controllability (CA):     {ca_score:.4f} (Ideally 1.0)")
+        print(f"  > Intensity Monotonicity (Spearman): {im_spearman:.4f} (Ideally 1.0)")
+        print(f"  > Intensity Linearity (Pearson):     {im_pearson:.4f} (Ideally 1.0)")
+        print("-"*30 + "\n")
     print(f"\nSweep Completed. Results saved to {out_dir}")
 
 # ==========================================
@@ -428,88 +570,314 @@ def run_multicond_sweep(ctx, args, dataset, indices):
 #   跑大量數據，不儲存中間圖片與 JSON。
 #   採用「一邊生成一邊篩選」的 Min-Heap 策略，最後才對 Top 1% 進行排序並存成 CSV。
 # ==========================================
-def run_benchmark_inference(ctx, args, dataset, indices):
-    print(f"\n=== Benchmark Mode (Top 1% Selection) ===")
-    print(f"Total Images to process: {len(indices)}")
-    
-    # 計算 Top 1% 數量
-    top_k_count = max(1, int(len(indices) * 0.01))
-    out_dir = f'./inference/{args.version}/benchmark'
-    os.makedirs(out_dir, exist_ok=True)
+def run_benchmark_phase1_quality(ctx, args, dataset, indices, out_dir):
+    """
+    Phase 1:
+      - 每張圖 inference 一次
+      - 算 SSIM/NIQE/BRISQUE/LPIPS
+      - 用 heap 維持 TopK：SSIM 高優先，NIQE 低作 tie-break
+      - 輸出 topk_quality.csv
+    """
+    if getattr(args, "bench_subset", None) is not None:
+        indices = indices[:args.bench_subset]
+        print(f"[Phase1] Using subset: {len(indices)} images")
 
-    # Min-Heap 用於動態篩選 Top 1%
-    # 存放格式: (ssim, -niqe, idx, image_pil, target_pil)
-    # Python 的 heapq 是 Min-Heap，所以會踢掉 (SSIM 最小) 或 (SSIM 相同但 -NIQE 最小即 NIQE 最大) 的元素
-    top_k_heap = [] 
-    
-    total_metrics = {"ssim": 0.0, "niqe": 0.0, "brisque": 0.0, "lpips": 0.0}
+    top_k = int(getattr(args, "top_k", 100))
+    csv_name = getattr(args, "topk_csv_name", "topk_quality.csv")
+
+    print(f"[Phase1] Selecting Top {top_k} by SSIM (tie-break: NIQE lower)")
+
+    total = {"ssim": 0.0, "niqe": 0.0, "brisque": 0.0, "lpips": 0.0}
     count = 0
+    top_heap = []  # store: (ssim, -niqe, idx, niqe, brisque, lpips)
 
-    pbar = tqdm(indices, desc="Benchmarking")
+    pbar = tqdm(indices, desc="Phase1: Quality")
     for idx in pbar:
         item = dataset[idx]
-        # Benchmark 模式下不儲存 debug 中間圖
+
         data = _prepare_batch_data(ctx, item, args, idx)
         image = _run_inference_internal(ctx, data, args, item)
 
-        s_score = _calculate_ssim(image, data['ori_pil'])
+        s_score = _calculate_ssim(image, data["ori_pil"])
         n_score = _calculate_niqe(image)
         b_score = _calculate_brisque(image)
-        l_score = _calculate_lpips(image, data['ori_pil'])
-        
-        total_metrics["ssim"] += s_score
-        total_metrics["niqe"] += n_score
-        total_metrics["brisque"] += b_score
-        total_metrics["lpips"] += l_score
+        l_score = _calculate_lpips(image, data["ori_pil"])
+
+        total["ssim"] += float(s_score)
+        total["niqe"] += float(n_score)
+        total["brisque"] += float(b_score)
+        total["lpips"] += float(l_score)
         count += 1
 
-        # --- 動態篩選邏輯 ---
-        # 使用 -n_score 是為了讓 NIQE 越小的人在 tuple 比較中顯得越大
-        current_entry = (s_score, -n_score, b_score, l_score, idx, image, data['ori_pil'])
-        
-        if len(top_k_heap) < top_k_count:
-            heapq.heappush(top_k_heap, current_entry)
+        entry = (float(s_score), -float(n_score), int(idx), float(n_score), float(b_score), float(l_score))
+
+        if len(top_heap) < top_k:
+            heapq.heappush(top_heap, entry)
         else:
-            # 如果當前這張圖比 Heap 裡面最爛的那張 (heap[0]) 還好，就替換掉
-            if (s_score, -n_score) > (top_k_heap[0][0], top_k_heap[0][1]):
-                heapq.heapreplace(top_k_heap, current_entry)
-        
-        # 更新進度條顯示當前 1% 的門檻
-        pbar.set_postfix({"Avg_S": f"{total_metrics['ssim']/count:.3f}", "Cutoff_S": f"{top_k_heap[0][0]:.3f}"})
-        
-    # --- 最終排序與寫入 CSV ---
-    # 依照 SSIM 降序，NIQE 升序
-    top_results = sorted(top_k_heap, key=lambda x: (x[0], -x[1]), reverse=True)
-    
-    csv_path = os.path.join(out_dir, "top_1_percent_rankings.csv")
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Rank', 'Image_ID', 'SSIM_Score', 'NIQE_Score', 'BRISQUE_Score', 'LPIPS_Score'])
-        for rank, (s, neg_n, b, l, res_idx, _, _) in enumerate(top_results, 1):
-            writer.writerow([rank, res_idx, f"{s:.5f}", f"{-neg_n:.5f}", f"{b:.5f}", f"{l:.5f}"])
+            worst = top_heap[0]
+            if (entry[0], entry[1]) > (worst[0], worst[1]):
+                heapq.heapreplace(top_heap, entry)
 
-    print(f"\n" + "="*40)
-    print(f"Benchmark Finished (Total processed: {count})")
-    print(f"Average SSIM:    {total_metrics['ssim']/count:.5f}")
-    print(f"Average NIQE:    {total_metrics['niqe']/count:.5f}")
-    print(f"Average BRISQUE: {total_metrics['brisque']/count:.5f}")
-    print(f"Average LPIPS:   {total_metrics['lpips']/count:.5f}")
-    print("="*40)
+        pbar.set_postfix({"avg_ssim": f"{total['ssim']/count:.4f}"})
 
-    # 建立 Dataset 存檔 (僅存 Top 1%)
-    data_dict = {"index": [], "ssim": [], "niqe": [], "brisque": [], "lpips": [], "image": [], "target": []}
-    for s, neg_n, b, l, res_idx, img, tgt in top_results:
-        data_dict["index"].append(res_idx)
-        data_dict["ssim"].append(s)
-        data_dict["niqe"].append(-neg_n)
-        data_dict["brisque"].append(b)
-        data_dict["lpips"].append(l)
-        data_dict["image"].append(img)
-        data_dict["target"].append(tgt)
+    print("\n[Phase1] Full-set Quality Averages:")
+    print(f"  SSIM   : {total['ssim']/count:.6f}")
+    print(f"  NIQE   : {total['niqe']/count:.6f}")
+    print(f"  BRISQUE: {total['brisque']/count:.6f}")
+    print(f"  LPIPS  : {total['lpips']/count:.6f}")
 
-    hf_ds = Dataset.from_dict(data_dict)
-    hf_ds.save_to_disk(os.path.join(out_dir, "top_1percent_dataset"))
-    print(f"Benchmark Done. CSV and Dataset saved to {out_dir}")
+    top_results = sorted(top_heap, key=lambda x: (x[0], x[1]), reverse=True)
+    csv_path = _save_topk_quality_csv(out_dir, top_results, filename=csv_name)
+
+    return csv_path
+
+def run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir):
+    """
+    Phase 2A (Color):
+      - 讀 topk_quality.csv
+      - 對 TopK 做顏色控制（預設 R/G/B），intensity 固定（預設 1.0）
+      - 每張圖每個顏色都算 CA
+      - 存成 HF Dataset：image_id / input / mask / relit / color_score + phase1 分數
+    """
+    rows = _load_topk_quality_csv(topk_csv_path)
+
+    color_str = getattr(args, "control_colors", "Red,Green,Blue")
+    color_names = [c.strip() for c in color_str.split(",") if c.strip()]
+    intensity = float(getattr(args, "control_intensity_for_color", 1.0))
+
+    max_items = getattr(args, "phase2_max_items", None)
+    if max_items is not None:
+        rows = rows[:int(max_items)]
+
+    COLORS = {
+        "Red":   [255, 0, 0],
+        "Green": [0, 255, 0],
+        "Blue":  [0, 0, 255],
+    }
+
+    control_tool = RelightingControlMetrics(resolution=ctx["resolution"])
+
+    records = {
+        "image_id": [],
+        "input_image": [],
+        "mask": [],
+        "relit_image": [],
+        "color_name": [],
+        "intensity": [],
+        "color_score": [],
+        "ssim": [],
+        "niqe": [],
+        "brisque": [],
+        "lpips": [],
+    }
+
+    print(f"[Phase2-Color] colors={color_names}, intensity={intensity}, n_images={len(rows)}")
+
+    for row in tqdm(rows, desc="Phase2: Color"):
+        idx = row["image_id"]
+        item = dataset[idx]
+
+        # input PIL
+        input_pil = item["image"] if (isinstance(item, dict) and "image" in item) else item["image"]
+
+        # mask PIL
+        if args.mode == 'lightlab':
+            print(f"Warning: Using lightlab mode for benchmark, cancel process. ")
+            break
+        else:
+            mask = item['mask'].convert('L')
+
+        # p_input once per image
+        p_input = control_tool.get_chromaticity_vector(input_pil, None)
+        dev = p_input.device
+
+        for cname in color_names:
+            if cname not in COLORS:
+                continue
+            rgb = COLORS[cname]
+
+            data = _prepare_batch_data(ctx, item, args, idx,
+                                       override_color=rgb,
+                                       override_intensity=float(intensity))
+            relit_pil = _run_inference_internal(ctx, data, args, item)
+
+            p_relit = control_tool.get_chromaticity_vector(relit_pil, None)
+            target_ab = _lab_target_ab_from_rgb(rgb, dev)
+
+            delta_p = p_relit - p_input
+            target_dir = target_ab - p_input
+
+            ca = F.cosine_similarity(delta_p.unsqueeze(0), target_dir.unsqueeze(0), dim=1).item()
+
+            records["image_id"].append(int(idx))
+            records["input_image"].append(input_pil)
+            records["mask"].append(mask)
+            records["relit_image"].append(relit_pil)
+            records["color_name"].append(cname)
+            records["intensity"].append(float(intensity))
+            records["color_score"].append(float(ca))
+
+            records["ssim"].append(float(row["ssim"]))
+            records["niqe"].append(float(row["niqe"]))
+            records["brisque"].append(float(row["brisque"]))
+            records["lpips"].append(float(row["lpips"]))
+
+    hf_ds = Dataset.from_dict(records)
+
+    save_name = getattr(args, "phase2_hf_name", "phase2_color_hf")
+    save_path = os.path.join(out_dir, save_name)
+    hf_ds.save_to_disk(save_path)
+    print(f"[Phase2-Color] Saved HF dataset -> {save_path}")
+
+    if getattr(args, "push_to_hub", False):
+        repo = getattr(args, "hf_repo_name", None)
+        if repo is None:
+            raise ValueError("push_to_hub=True but hf_repo_name is None")
+        hf_ds.push_to_hub(repo)
+        print(f"[Phase2-Color] Pushed to hub -> {repo}")
+
+    # print mean CA per color
+    for cname in color_names:
+        vals = [v for (n, v) in zip(records["color_name"], records["color_score"]) if n == cname]
+        if len(vals):
+            print(f"[Phase2-Color] Mean CA ({cname}) = {float(np.mean(vals)):.4f}")
+
+    return save_path
+
+def run_benchmark_phase2_intensity(ctx, args, dataset, topk_csv_path, out_dir):
+    """
+    Phase 2B (Intensity):
+      - 讀 topk_quality.csv
+      - 對 TopK 的每張圖跑 intensity sweep
+      - 每張圖把 luma_0.0 ... luma_1.0 存成一列 CSV（方便後續統計）
+      - 再算 dataset mean curve + Spearman/Pearson，並輸出 curve CSV
+    """
+    rows = _load_topk_quality_csv(topk_csv_path)
+
+    max_items = getattr(args, "phase2_max_items", None)
+    if max_items is not None:
+        rows = rows[:int(max_items)]
+
+    # intensity sweep
+    sweep_str = getattr(args, "control_intensity_sweep", "0.0,0.2,0.5,0.8,1.0")
+    intensity_list = [float(x) for x in sweep_str.split(",")]
+
+    # intensity evaluation uses white light by default
+    intensity_color = [255, 255, 255]
+
+    control_tool = RelightingControlMetrics(resolution=ctx["resolution"])
+    luma_v_3d = control_tool.luma_weights.view(3, 1, 1).to("cuda")
+
+    perimg_csv = os.path.join(out_dir, getattr(args, "phase2_intensity_csv", "phase2_intensity_per_image.csv"))
+    curve_csv = os.path.join(out_dir, getattr(args, "phase2_intensity_curve_csv", "phase2_intensity_curve.csv"))
+
+    # ---- per-image csv ----
+    with open(perimg_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        header = ["image_id", "ssim", "niqe", "brisque", "lpips"] + [f"luma_{a}" for a in intensity_list]
+        w.writerow(header)
+
+        for row in tqdm(rows, desc="Phase2: Intensity(per-image)"):
+            idx = row["image_id"]
+            item = dataset[idx]
+
+            luma_values = []
+            for alpha in intensity_list:
+                data_i = _prepare_batch_data(ctx, item, args, idx,
+                                             override_color=intensity_color,
+                                             override_intensity=float(alpha))
+                image_i = _run_inference_internal(ctx, data_i, args, item)
+
+                img_t = transforms.ToTensor()(image_i).to("cuda")
+                luma_map = (img_t * luma_v_3d).sum(dim=0)
+                luma_values.append(float(luma_map.mean().item()))
+
+            w.writerow([
+                int(idx),
+                float(row["ssim"]),
+                float(row["niqe"]),
+                float(row["brisque"]),
+                float(row["lpips"]),
+                *luma_values
+            ])
+
+    print(f"[Phase2-Intensity] Saved per-image intensity CSV -> {perimg_csv}")
+
+    # ---- compute dataset mean curve from per-image csv ----
+    per_rows = []
+    with open(perimg_csv, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for rr in r:
+            per_rows.append(rr)
+
+    mean_curve = []
+    for a in intensity_list:
+        key = f"luma_{a}"
+        vals = [float(rr[key]) for rr in per_rows]
+        mean_curve.append(float(np.mean(vals)))
+
+    sp, _ = spearmanr(intensity_list, mean_curve)
+    pr, _ = pearsonr(intensity_list, mean_curve)
+
+    # save curve csv
+    with open(curve_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["alpha", "mean_luma"])
+        for a, y in zip(intensity_list, mean_curve):
+            w.writerow([a, y])
+        w.writerow([])
+        w.writerow(["spearman", float(sp)])
+        w.writerow(["pearson", float(pr)])
+
+    print(f"[Phase2-Intensity] Saved mean curve CSV -> {curve_csv}")
+    print(f"[Phase2-Intensity] Spearman={float(sp):.4f}, Pearson={float(pr):.4f}")
+
+    return perimg_csv, curve_csv, mean_curve, float(sp), float(pr)
+
+def run_benchmark_three_phase(ctx, args, dataset, indices):
+    out_dir = f'./inference/{args.version}/benchmark'
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Phase 1
+    topk_csv_path = run_benchmark_phase1_quality(ctx, args, dataset, indices, out_dir)
+
+    # Phase 2A: Color -> HF dataset
+    run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir)
+
+    # Phase 2B: Intensity -> per-image CSV + mean curve CSV
+    run_benchmark_phase2_intensity(ctx, args, dataset, topk_csv_path, out_dir)
+
+    print("\n[Benchmark] Done (Phase1 + Phase2-Color + Phase2-Intensity).")
+
+def _save_topk_quality_csv(out_dir, top_results, filename="topk_quality.csv"):
+    """
+    top_results: list of tuples (ssim, neg_niqe, idx, niqe, brisque, lpips)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, filename)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "image_id", "ssim", "niqe", "brisque", "lpips"])
+        for rank, (ssim, neg_niqe, idx, niqe, brisque, lpips) in enumerate(top_results):
+            w.writerow([rank, idx, float(ssim), float(niqe), float(brisque), float(lpips)])
+    print(f"[Phase1] Saved TopK CSV -> {csv_path}")
+    return csv_path
+
+def _load_topk_quality_csv(csv_path):
+    rows = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append({
+                "rank": int(row["rank"]),
+                "image_id": int(row["image_id"]),
+                "ssim": float(row["ssim"]),
+                "niqe": float(row["niqe"]),
+                "brisque": float(row["brisque"]),
+                "lpips": float(row["lpips"]),
+            })
+    return rows
+
 
 # ==========================================
 # Helper Functions
@@ -706,6 +1074,12 @@ def _run_inference_internal(ctx, data, args, item):
         pipe_output, _, _ = ctx['pipe'](**pipe_kwargs)
         return pipe_output.images[0]
 
+def _lab_target_ab_from_rgb(color_rgb, device):
+    c = torch.tensor(color_rgb, dtype=torch.float32) / 255.0
+    target_rgb_np = c.numpy().reshape(1, 1, 3).astype(np.float32)
+    target_lab = skcolor.rgb2lab(target_rgb_np)
+    target_ab = torch.tensor(target_lab[0, 0, 1:3], dtype=torch.float32, device=device)
+    return target_ab
 
 # ==========================================
 # Main Entry Point
@@ -724,6 +1098,28 @@ if __name__ == "__main__":
     parser.add_argument('-seed', '--seed', type=int, default=6071)
     parser.add_argument('-pp', '--print_process', action='store_true')
     parser.add_argument('-gs', '--guidance_scale', type=float, default=0.0, help="SSIM Guidance Scale")
+    
+    # [新增] Benchmark 模式專用選項
+    # Phase1
+    parser.add_argument("--bench_subset", type=int, default=None)
+    parser.add_argument("--top_k", type=int, default=100)
+    parser.add_argument("--topk_csv_name", type=str, default="topk_quality.csv")
+
+    # Phase2 shared
+    parser.add_argument("--phase2_max_items", type=int, default=None)  # e.g. 100
+    # Phase2 color
+    parser.add_argument("--control_colors", type=str, default="Red,Green,Blue")
+    parser.add_argument("--control_intensity_for_color", type=float, default=1.0)
+    parser.add_argument("--phase2_hf_name", type=str, default="phase2_color_hf")
+
+    # Phase2 intensity
+    parser.add_argument("--control_intensity_sweep", type=str, default="0.0,0.2,0.5,0.8,1.0")
+    parser.add_argument("--phase2_intensity_csv", type=str, default="phase2_intensity_per_image.csv")
+    parser.add_argument("--phase2_intensity_curve_csv", type=str, default="phase2_intensity_curve.csv")
+
+    # optional HF upload
+    parser.add_argument("--push_to_hub", action="store_true")
+    parser.add_argument("--hf_repo_name", type=str, default=None)
     args = parser.parse_args()
 
     # 1. Setup
@@ -774,4 +1170,4 @@ if __name__ == "__main__":
         # [New] Color/Intensity Sweep
         run_multicond_sweep(ctx, args, dataset_to_use, indices)
     elif args.task == 'benchmark':
-        run_benchmark_inference(ctx, args, dataset_to_use, indices)
+        run_benchmark_three_phase(ctx, args, dataset_to_use, indices)
