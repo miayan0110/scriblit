@@ -19,6 +19,7 @@ from skimage.metrics import structural_similarity as ssim
 from skimage import color as skcolor
 from scipy.stats import spearmanr, pearsonr
 import matplotlib.pyplot as plt
+import random
 
 # Custom Imports
 from network_controlnet import ControlNetModel
@@ -1114,7 +1115,7 @@ if __name__ == "__main__":
 
     # optional HF upload
     parser.add_argument("--push_to_hub", action="store_true")
-    parser.add_argument("--hf_repo_name", type=str, default=None)
+    parser.add_argument("--hf_repo_name", type=str, default='Miayan/test-visualize')
     args = parser.parse_args()
 
     # 1. Setup
@@ -1152,8 +1153,16 @@ if __name__ == "__main__":
     else:
         # Standard mode indices
         if args.task == 'benchmark':
-            limit = min(args.data, len(ds))
-            indices = range(limit)
+            total_len = len(ds)
+            sample_size = min(args.data, total_len)
+
+            print(f"[Benchmark] Randomly sampling {sample_size} images from {total_len}")
+            print(f"[Benchmark] Using random seed: {args.seed}")
+
+            # 固定 seed 讓結果可重現
+            random.seed(args.seed)
+
+            indices = random.sample(range(total_len), sample_size)
         else:
             indices = range(args.data)
         dataset_to_use = ds
