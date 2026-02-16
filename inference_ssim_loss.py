@@ -578,14 +578,10 @@ def run_benchmark_phase1_quality(ctx, args, dataset, indices, out_dir):
       - 用 heap 維持 TopK：SSIM 高優先，NIQE 低作 tie-break
       - 輸出 topk_quality.csv
     """
-    if getattr(args, "bench_subset", None) is not None:
-        indices = indices[:args.bench_subset]
-        print(f"[Phase1] Using subset: {len(indices)} images")
-
     top_k = int(getattr(args, "top_k", 100))
     csv_name = getattr(args, "topk_csv_name", "topk_quality.csv")
 
-    print(f"[Phase1] Selecting Top {top_k} by SSIM (tie-break: NIQE lower)")
+    print(f"[Phase1] Selecting Top {top_k} from {len(indices)} images by SSIM (tie-break: NIQE lower)")
 
     total = {"ssim": 0.0, "niqe": 0.0, "brisque": 0.0, "lpips": 0.0}
     count = 0
@@ -1101,7 +1097,6 @@ if __name__ == "__main__":
     
     # [新增] Benchmark 模式專用選項
     # Phase1
-    parser.add_argument("--bench_subset", type=int, default=None)
     parser.add_argument("--top_k", type=int, default=100)
     parser.add_argument("--topk_csv_name", type=str, default="topk_quality.csv")
 
