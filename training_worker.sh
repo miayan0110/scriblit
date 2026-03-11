@@ -189,6 +189,7 @@ run_watchdog() {
     local DIR_NAME=$(basename "$output_dir")
 
     echo "🛡️  進入監控模式 ($target_ckpt)..."
+    sleep 100 # 給訓練腳本一點時間穩定下來，避免剛啟動就誤判
 
     while true; do
         # 檢查是否還在跑 (只看我自己的 process)

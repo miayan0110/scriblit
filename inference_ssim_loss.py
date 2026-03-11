@@ -20,6 +20,7 @@ from skimage import color as skcolor
 from scipy.stats import spearmanr, pearsonr
 import matplotlib.pyplot as plt
 import random
+from PIL import Image, ImageDraw, ImageFont
 
 # Custom Imports
 from network_controlnet import ControlNetModel
@@ -112,6 +113,133 @@ class RelightingControlMetrics:
         weighted_sum = (ab_t * w).sum(dim=(0, 1))         # (2,)
         weight_total = w.sum() + self.eps
         return weighted_sum / weight_total
+    
+    def build_deltaY_weight_mask(self, ori_pil, relit_pil, q=92):
+        """
+        ROI from luminance change |ΔY|
+        - Gaussian blur to suppress edge noise
+        - Hard percentile threshold (binary mask)
+        """
+
+        ori = self.resizer(ori_pil).convert("RGB")
+        rel = self.resizer(relit_pil).convert("RGB")
+
+        o = np.asarray(ori).astype(np.float32) / 255.0
+        r = np.asarray(rel).astype(np.float32) / 255.0
+
+        Yo = 0.2126 * o[..., 0] + 0.7152 * o[..., 1] + 0.0722 * o[..., 2]
+        Yr = 0.2126 * r[..., 0] + 0.7152 * r[..., 1] + 0.0722 * r[..., 2]
+
+        d = np.abs(Yr - Yo)
+
+        # 🔥 去邊緣雜訊
+        import cv2
+        d = cv2.GaussianBlur(d, (7, 7), 0)
+
+        # 🔥 只取顯著變化區域
+        thr_val = np.percentile(d, q)
+        mask = (d > thr_val).astype(np.float32)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.from_numpy(mask).to(device)
+    
+    def ca_directional_delta_ab(self, ori_pil, relit_pil, target_rgb, weight_mask=None):
+        """
+        Directional CA:
+        cosine( mean_ROI(Δab), target_ab )
+        """
+
+        ori = self.resizer(ori_pil).convert("RGB")
+        rel = self.resizer(relit_pil).convert("RGB")
+
+        o = np.asarray(ori).astype(np.float32) / 255.0
+        r = np.asarray(rel).astype(np.float32) / 255.0
+
+        o_lab = skcolor.rgb2lab(o)
+        r_lab = skcolor.rgb2lab(r)
+
+        delta_ab = (r_lab[:, :, 1:3] - o_lab[:, :, 1:3]).astype(np.float32)
+
+        device = weight_mask.device if weight_mask is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        d_t = torch.from_numpy(delta_ab).to(device)
+
+        if weight_mask is None:
+            dp = d_t.mean(dim=(0, 1))
+        else:
+            m = weight_mask.to(device)
+            if m.shape[-2:] != d_t.shape[:2]:
+                m = F.interpolate(
+                    m.unsqueeze(0).unsqueeze(0),
+                    size=d_t.shape[:2],
+                    mode="bilinear",
+                    align_corners=False
+                ).squeeze()
+            w = m.unsqueeze(-1)
+            dp = (d_t * w).sum(dim=(0, 1)) / (w.sum() + self.eps)
+
+        # target ab direction
+        trgb = (np.array(target_rgb, dtype=np.float32) / 255.0).reshape(1, 1, 3)
+        t_ab = skcolor.rgb2lab(trgb)[0, 0, 1:3].astype(np.float32)
+        t = torch.from_numpy(t_ab).to(device)
+
+        if torch.norm(dp) < 1e-6:
+            return 0.0
+
+        return F.cosine_similarity(
+            dp.unsqueeze(0),
+            t.unsqueeze(0),
+            dim=1,
+            eps=self.eps
+        ).item()
+        
+    def ca_directional_deltaY_roi(self, ori_pil, relit_pil, target_rgb, q=92):
+        """
+        ROI = |ΔY|
+        CA  = cosine(mean_ROI(Δab), target_ab)
+        """
+        w = self.build_deltaY_weight_mask(ori_pil, relit_pil, q=q)
+
+        if float(w.sum().item()) < 1e-6:
+            return 0.0
+
+        return self.ca_directional_delta_ab(
+            ori_pil,
+            relit_pil,
+            target_rgb,
+            weight_mask=w
+        )
+
+    def save_ca_roi_mask(self, ori_pil, relit_pil, save_prefix, q=92):
+        """
+        Save:
+            save_prefix + "_mask.png"
+            save_prefix + "_overlay.png"
+        """
+
+        w = self.build_deltaY_weight_mask(ori_pil, relit_pil, q=q)
+        w_np = w.detach().cpu().numpy()
+
+        # -------- save mask --------
+        mask_u8 = (w_np * 255).astype(np.uint8)
+        mask_pil = Image.fromarray(mask_u8, mode="L")
+        mask_pil.save(save_prefix + "_mask.png")
+
+        # -------- save overlay --------
+        base = self.resizer(relit_pil).convert("RGB")
+        base_np = np.asarray(base).astype(np.float32)
+
+        red_overlay = np.zeros_like(base_np)
+        red_overlay[..., 0] = 255  # red channel
+
+        alpha = 0.5
+        overlay = base_np.copy()
+        overlay[w_np > 0] = (
+            base_np[w_np > 0] * (1 - alpha)
+            + red_overlay[w_np > 0] * alpha
+        )
+
+        overlay = overlay.astype(np.uint8)
+        Image.fromarray(overlay).save(save_prefix + "_overlay.png")
 
     def calculate_ca(self, delta_p_list, target_p_list):
         scores = []
@@ -430,7 +558,11 @@ def guided_generation(ctx, pipe_kwargs, target_img_tensor, guidance_scale=0.0):
 # ==========================================
 def run_single_inference(ctx, args, dataset, indices):
     print("--- Mode: Single Inference ---")
-    out_dir = f'./inference/{args.version}'
+    out_dir = f'./inference/{args.version}/{args.mode}_{args.guidance_scale:04.0f}'
+    if args.use_pretrained_alb:
+        out_dir += "_prealb"
+    if args.auto_exposure:
+        out_dir += "_autoexp"
     os.makedirs(out_dir, exist_ok=True)
 
     for idx in indices:
@@ -441,21 +573,28 @@ def run_single_inference(ctx, args, dataset, indices):
         image = _run_inference_internal(ctx, data, args, item)
 
         # 計算四項品質指標
-        s_score = _calculate_ssim(image, data['ori_pil'])
+        target = data['target_pil'] if args.mode == 'lightlab' else data['ori_pil']
+        p_score = _calculate_psnr(image, target)
+        s_score = _calculate_ssim(image, target)
         n_score = _calculate_niqe(image)
         b_score = _calculate_brisque(image)
-        l_score = _calculate_lpips(image, data['ori_pil'])
+        l_score = _calculate_lpips(image, target)
         
         # 儲存結果與對照圖
         suffix = f"{idx}_{args.seed}"
         if args.guidance_scale > 0:
             suffix += f"_gs{args.guidance_scale}"
         
-        image.save(f"{out_dir}/output_{suffix}.png")
-        data['ori_pil'].save(f"{out_dir}/ori_{suffix}.png")
-        data['target_pil'].save(f"{out_dir}/target_{suffix}.png")
+        save_inference_visuals(
+            out_dir,
+            suffix,
+            data["ori_pil"],
+            image,
+            data["target_pil"],
+            mask_pil=data["mask"]  # 有 mask 再放
+        )
         
-        print(f"[Single] ID {idx} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f} | BRISQUE: {b_score:.4f} | LPIPS: {l_score:.4f}")
+        print(f"[Single] ID {idx}  | PSNR: {p_score:.4f} | SSIM: {s_score:.4f} | NIQE: {n_score:.4f} | BRISQUE: {b_score:.4f} | LPIPS: {l_score:.4f}")
     print(f"Saved to: {out_dir}")
 
 # ==========================================
@@ -485,11 +624,12 @@ def run_multicond_sweep(ctx, args, dataset, indices):
         
         # 1. 準備量測區域 (Lightmap Luma)        
         # 色度基準
-        p_input = control_tool.get_chromaticity_vector(item['image'])
+        # p_input = control_tool.get_chromaticity_vector(item['image'])
 
         # --- 第一階段：Color Sweep (計算品質指標 + CA) ---
         print("\n[Phase 1] Sweeping Colors...")
         delta_p_list, target_p_list = [], []
+        first_save = True
         
         for c_name, c_val in COLORS.items():
             data = _prepare_batch_data(ctx, item, args, idx, override_color=c_val, override_intensity=1.0)
@@ -502,16 +642,33 @@ def run_multicond_sweep(ctx, args, dataset, indices):
             l = _calculate_lpips(image, data['ori_pil'])
             
             # (2) CA 指標相關紀錄
-            p_relit = control_tool.get_chromaticity_vector(image)
-            delta_p_list.append(p_relit - p_input)
-            c_t = torch.tensor(c_val, dtype=torch.float32) / 255.0  # (3,)
-            target_rgb = c_t.cpu().numpy().reshape(1, 1, 3).astype(np.float32)
-            target_lab = skcolor.rgb2lab(target_rgb)  # (1,1,3)
-            target_ab = torch.tensor(target_lab[0, 0, 1:3], dtype=torch.float32, device=p_input.device)  # (2,)
-            target_p_list.append(target_ab - p_input)
+            # p_relit = control_tool.get_chromaticity_vector(image)
+            # delta_p_list.append(p_relit - p_input)
+            # c_t = torch.tensor(c_val, dtype=torch.float32) / 255.0  # (3,)
+            # target_rgb = c_t.cpu().numpy().reshape(1, 1, 3).astype(np.float32)
+            # target_lab = skcolor.rgb2lab(target_rgb)  # (1,1,3)
+            # target_ab = torch.tensor(target_lab[0, 0, 1:3], dtype=torch.float32, device=p_input.device)  # (2,)
+            # target_p_list.append(target_ab - p_input)
             
-            ca_single = F.cosine_similarity((p_relit - p_input).unsqueeze(0), (target_ab - p_input).unsqueeze(0),).item()
+            # ca_single = F.cosine_similarity((p_relit - p_input).unsqueeze(0), (target_ab - p_input).unsqueeze(0),).item()
 
+            ca_single = control_tool.ca_directional_deltaY_roi(
+                data["ori_pil"],   # input PIL
+                image,             # relit PIL
+                c_val,             # target RGB in 0..255 (你原本的 c_val 就是)
+                q=92
+            )
+            
+            if first_save:
+                prefix = os.path.join(out_dir, f"img{idx}_roi")
+                control_tool.save_ca_roi_mask(
+                    data["ori_pil"],
+                    image,
+                    prefix,
+                    q=92
+                )
+                first_save = False
+            
             image.save(os.path.join(out_dir, f"img{idx}_color_{c_name}.png"))
             print(f"    Color {c_name:8} | SSIM: {s:.4f} | NIQE: {n:.4f} | BRISQUE: {b:.4f} | LPIPS: {l:.4f} | CA: {ca_single:.4f}")
 
@@ -618,15 +775,19 @@ def run_benchmark_phase1_quality(ctx, args, dataset, indices, out_dir):
         pbar.set_postfix({"avg_ssim": f"{total['ssim']/count:.4f}"})
 
     print("\n[Phase1] Full-set Quality Averages:")
-    print(f"  SSIM   : {total['ssim']/count:.6f}")
-    print(f"  NIQE   : {total['niqe']/count:.6f}")
-    print(f"  BRISQUE: {total['brisque']/count:.6f}")
-    print(f"  LPIPS  : {total['lpips']/count:.6f}")
+    avg_ssim = total["ssim"] / count
+    avg_niqe = total["niqe"] / count
+    avg_brisque = total["brisque"] / count
+    avg_lpips = total["lpips"] / count
+    print(f"  SSIM   : {avg_ssim:.6f}")
+    print(f"  NIQE   : {avg_niqe:.6f}")
+    print(f"  BRISQUE: {avg_brisque:.6f}")
+    print(f"  LPIPS  : {avg_lpips:.6f}")
 
     top_results = sorted(top_heap, key=lambda x: (x[0], x[1]), reverse=True)
     csv_path = _save_topk_quality_csv(out_dir, top_results, filename=csv_name)
 
-    return csv_path
+    return csv_path, avg_ssim, avg_niqe, avg_brisque, avg_lpips
 
 def run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir):
     """
@@ -685,8 +846,9 @@ def run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir)
             mask = item['mask'].convert('L')
 
         # p_input once per image
-        p_input = control_tool.get_chromaticity_vector(input_pil, None)
-        dev = p_input.device
+        # p_input = control_tool.get_chromaticity_vector(input_pil, None)
+        # dev = p_input.device
+        dev = "cuda"  # 假設 control_tool 內部會把向量轉到 cuda
 
         for cname in color_names:
             if cname not in COLORS:
@@ -698,13 +860,20 @@ def run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir)
                                        override_intensity=float(intensity))
             relit_pil = _run_inference_internal(ctx, data, args, item)
 
-            p_relit = control_tool.get_chromaticity_vector(relit_pil, None)
-            target_ab = _lab_target_ab_from_rgb(rgb, dev)
+            # p_relit = control_tool.get_chromaticity_vector(relit_pil, None)
+            # target_ab = _lab_target_ab_from_rgb(rgb, dev)
 
-            delta_p = p_relit - p_input
-            target_dir = target_ab - p_input
+            # delta_p = p_relit - p_input
+            # target_dir = target_ab - p_input
 
-            ca = F.cosine_similarity(delta_p.unsqueeze(0), target_dir.unsqueeze(0), dim=1).item()
+            # ca = F.cosine_similarity(delta_p.unsqueeze(0), target_dir.unsqueeze(0), dim=1).item()
+            
+            ca = control_tool.ca_directional_deltaY_roi(
+                input_pil,
+                relit_pil,
+                rgb,      # target RGB in 0..255
+                q=92
+            )
 
             records["image_id"].append(int(idx))
             records["input_image"].append(input_pil)
@@ -734,12 +903,15 @@ def run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir)
         print(f"[Phase2-Color] Pushed to hub -> {repo}")
 
     # print mean CA per color
+    avg_ca = []
     for cname in color_names:
         vals = [v for (n, v) in zip(records["color_name"], records["color_score"]) if n == cname]
         if len(vals):
-            print(f"[Phase2-Color] Mean CA ({cname}) = {float(np.mean(vals)):.4f}")
+            mean_val = float(np.mean(vals))
+            print(f"[Phase2-Color] Mean CA ({cname}) = {mean_val:.4f}")
+            avg_ca.append([cname, mean_val])
 
-    return save_path
+    return save_path, avg_ca
 
 def run_benchmark_phase2_intensity(ctx, args, dataset, topk_csv_path, out_dir):
     """
@@ -832,19 +1004,41 @@ def run_benchmark_phase2_intensity(ctx, args, dataset, topk_csv_path, out_dir):
     return perimg_csv, curve_csv, mean_curve, float(sp), float(pr)
 
 def run_benchmark_three_phase(ctx, args, dataset, indices):
-    out_dir = f'./inference/{args.version}/benchmark'
+    out_dir = f'./inference/{args.version}/benchmark_{args.guidance_scale:04.0f}'
+    if args.use_pretrained_alb:
+        out_dir += "_prealb"
+    if args.auto_exposure:
+        out_dir += "_autoexp"
+    print(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     # Phase 1
-    topk_csv_path = run_benchmark_phase1_quality(ctx, args, dataset, indices, out_dir)
+    topk_csv_path, avg_ssim, avg_niqe, avg_brisque, avg_lpips = run_benchmark_phase1_quality(ctx, args, dataset, indices, out_dir)
 
     # Phase 2A: Color -> HF dataset
-    run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir)
+    _, avg_ca = run_benchmark_phase2_color_to_hf(ctx, args, dataset, topk_csv_path, out_dir)
 
     # Phase 2B: Intensity -> per-image CSV + mean curve CSV
-    run_benchmark_phase2_intensity(ctx, args, dataset, topk_csv_path, out_dir)
+    _, _, _, spearman_im, pearson_im = run_benchmark_phase2_intensity(ctx, args, dataset, topk_csv_path, out_dir)
 
     print("\n[Benchmark] Done (Phase1 + Phase2-Color + Phase2-Intensity).")
+    
+    record_file = f"{out_dir}/benchmark_results.txt"
+    with open(record_file, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*50}\n")
+        f.write(f"實驗名稱: {args.version}\n")
+        f.write(f"總共跑了幾張圖: {len(indices)}\n")
+        f.write(f"平均分數結果:\n")
+        f.write(f"  SSIM: {avg_ssim:.4f}\n")
+        f.write(f"  LPIPS: {avg_lpips:.4f}\n")
+        f.write(f"  NIQE: {avg_niqe:.4f}\n")
+        f.write(f"  BRISQUE: {avg_brisque:.4f}\n")
+        for cname, ca_val in avg_ca:
+            f.write(f"  CA (Color Accuracy) - {cname}: {ca_val:.4f}\n")
+        f.write(f"  IM (Intensity Monotonicity) - Spearman: {spearman_im:.4f}, Pearson: {pearson_im:.4f}\n")
+        f.write(f"{'='*50}\n")
+    
+    print(f"\n[Done] 數據已自動存入 {record_file}")
 
 def _save_topk_quality_csv(out_dir, top_results, filename="topk_quality.csv"):
     """
@@ -875,6 +1069,368 @@ def _load_topk_quality_csv(csv_path):
             })
     return rows
 
+# ==========================================
+# 5. BigTime資料集推理模式 (BigTime Inference)
+# 說明：最基本的模式，會詳細輸出 Lightmap, Albedo, Reconstruction 等中間產物方便 Debug。
+# ==========================================
+def run_bigtime_test(ctx, args, dataset, gt_configs):
+    """
+    ctx: 模型組件 (unet, controlnet 等)
+    args: 推理設定
+    """
+    print("--- Mode: BigTime Inference ---")
+    out_dir = f'./inference/{args.version}/bigtime_{args.guidance_scale:04.0f}'
+    if args.use_pretrained_alb:
+        out_dir += "_prealb"
+    if args.auto_exposure:
+        out_dir += "_autoexp"
+    os.makedirs(out_dir, exist_ok=True)
+    results = []
+    
+    for i, cfg in enumerate(tqdm(gt_configs, desc="BigTime Testing")):
+        # 1. 取得資料
+        input_img_id = cfg['input_id']
+        data = _prepare_bigtime_data(ctx, dataset[input_img_id], args, cfg)
+        
+        # 2. 模型推理
+        image = _run_inference_internal(ctx, data, args)
+
+        # 3. 計算分數
+        p_score = _calculate_psnr(image, data["gt_image"])
+        s_score = _calculate_ssim(image, data["gt_image"])
+        n_score = _calculate_niqe(image)
+        b_score = _calculate_brisque(image)
+        l_score = _calculate_lpips(image, data["gt_image"])
+        
+        pseudo = data["target_pil"]  # physics API pseudo GT
+        pg_psnr = _calculate_psnr(pseudo, data["gt_image"])
+        pg_ssim = _calculate_ssim(pseudo, data["gt_image"])
+        pg_lpips = _calculate_lpips(pseudo, data["gt_image"])
+        
+        results.append({
+            "input_id": input_img_id,
+            "gt_col": cfg['gt_col'],
+            "psnr": p_score,
+            "ssim": s_score,
+            "niqe": n_score,
+            "brisque": b_score,
+            "lpips": l_score,
+            "pseudo_gt_psnr": pg_psnr,
+            "pseudo_gt_ssim": pg_ssim,
+            "pseudo_gt_lpips": pg_lpips,
+        })
+        
+        image.save(f"{out_dir}/output_{i:03d}.png")
+        data['ori_pil'].save(f"{out_dir}/ori_{i:03d}.png")
+        data['gt_image'].save(f"{out_dir}/gt_{i:03d}.png")
+        data['target_pil'].save(f"{out_dir}/pseudo_gt_{i:03d}.png")
+
+    # 5. 輸出統計
+    psnrs = [r["psnr"] for r in results]
+    ssims = [r["ssim"] for r in results]
+    niqes = [r["niqe"] for r in results]
+    brisques = [r["brisque"] for r in results]
+    lpips = [r["lpips"] for r in results]
+    pg_psnrs = [r["pseudo_gt_psnr"] for r in results]
+    pg_ssims = [r["pseudo_gt_ssim"] for r in results]
+    pg_lpips = [r["pseudo_gt_lpips"] for r in results]
+    
+    mean_psnr = np.mean(psnrs)
+    mean_ssim = np.mean(ssims)
+    mean_niqe = np.mean(niqes)
+    mean_brisque = np.mean(brisques)
+    mean_lpips = np.mean(lpips)
+    mean_pg_psnr = np.mean(pg_psnrs)
+    mean_pg_ssim = np.mean(pg_ssims)
+    mean_pg_lpips = np.mean(pg_lpips)
+
+    print(f"\n📊 BigTime Test Summary:")
+    print(f"   Samples: {len(results)}")
+    print(f"   Mean PSNR: {mean_psnr:.4f}")
+    print(f"   Mean SSIM: {mean_ssim:.4f}")
+    print(f"   Mean LPIPS: {mean_lpips:.4f}")
+    print(f"   Mean NIQE: {mean_niqe:.4f}")
+    print(f"   Mean BRISQUE: {mean_brisque:.4f}")
+    print(f"[PseudoGT vs GT] Mean PSNR:  {mean_pg_psnr:.4f}")
+    print(f"[PseudoGT vs GT] Mean SSIM:  {mean_pg_ssim:.4f}")
+    print(f"[PseudoGT vs GT] Mean LPIPS: {mean_pg_lpips:.4f}")
+    
+    txt_path = os.path.join(out_dir, "bigtime_results.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("BigTime Test Summary\n")
+        f.write("=" * 40 + "\n")
+        f.write(f"Samples: {len(results)}\n")
+        f.write(f"Mean PSNR: {mean_psnr:.6f}\n")
+        f.write(f"Mean SSIM: {mean_ssim:.6f}\n")
+        f.write(f"Mean NIQE: {mean_niqe:.6f}\n")
+        f.write(f"Mean BRISQUE: {mean_brisque:.6f}\n")
+        f.write(f"Mean LPIPS: {mean_lpips:.6f}\n")
+        f.write(f"[PseudoGT vs GT] Mean PSNR:  {mean_pg_psnr:.6f}\n")
+        f.write(f"[PseudoGT vs GT] Mean SSIM:  {mean_pg_ssim:.6f}\n")
+        f.write(f"[PseudoGT vs GT] Mean LPIPS: {mean_pg_lpips:.6f}\n")
+        f.write("=" * 40 + "\n")
+
+    print(f"\n✅ 結果已儲存至: {txt_path}")
+    
+    return results
+
+# ==========================================
+# 6. Lsun資料集推理模式 (BigTime Inference)
+# 說明：最基本的模式，會詳細輸出 Lightmap, Albedo, Reconstruction 等中間產物方便 Debug。
+# ==========================================
+def run_custom_id_color_test(ctx, args, dataset, image_ids):
+    """
+    Custom Test:
+    - Color controllability metric: CA (cosine similarity in Lab ab direction) averaged over all test images & colors
+    - Intensity controllability metric: average Δluma curve (relative to alpha=0.0) over all test images
+      and save a mean curve plot (with 95% CI).
+
+    Output:
+      ./inference/{args.version}/custom_test_{gs}/
+        imgXXXXX/ ... per-image outputs
+        intensity_delta_luma_mean_curve.png
+        custom_test_summary.txt
+    """
+    print("--- Mode: Custom Test (IDs x Color + Intensity Metrics) ---")
+
+    control_tool = RelightingControlMetrics(resolution=ctx["resolution"])
+    luma_v_3d = control_tool.luma_weights.view(3, 1, 1).to("cuda")
+
+    # TEST_COLOR_LIST = [
+    #     ("L_Magenta", [255, 0, 255]),
+    #     ("L_Purple",  [125, 0, 255]),
+    #     ("L_Cyan",    [0, 255, 255]),
+    #     ("L_Green",   [0, 255, 0]),
+    #     ("L_Yellow",  [255, 255, 0]),
+    # ]
+    
+    TEST_COLOR_LIST = [
+        ("Magenta", [255, 0, 255]),
+        ("Blue",  [0, 0, 255]),
+        ("Cyan",    [0, 255, 255]),
+        ("Green",   [0, 255, 0]),
+        ("Yellow",  [255, 255, 0]),
+        ("Red",  [255, 0, 0]),
+    ]
+    # 強度測試：白色 + 6 個強度（包含 0.0 才能算 Δluma）
+    TEST_INTENSITY_LIST = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    WHITE = [255, 255, 255]
+
+    out_dir = f'./inference/{args.version}/custom_test_{args.guidance_scale:04.0f}'
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---------
+    # Aggregators (across all test images)
+    # ---------
+    ca_all = []  # all (image,color) CA
+    ca_by_color = {name: [] for name, _ in TEST_COLOR_LIST}
+
+    # intensity: collect per-image Δluma arrays shape (N_images, N_intensities)
+    delta_luma_all = []
+
+    # =========
+    # Loop images
+    # =========
+    for img_id in image_ids:
+        item = dataset[int(img_id)]
+
+        subdir = os.path.join(out_dir, f"img{int(img_id):05d}")
+        os.makedirs(subdir, exist_ok=True)
+
+        # Save input
+        item["image"].save(os.path.join(subdir, "input.png"))
+
+        # ---------- Color metric (CA) ----------
+        # p_input: chromaticity mean of input image in Lab ab
+        # p_input = control_tool.get_chromaticity_vector(item["image"], weight_mask=None)
+        # dev = p_input.device
+        dev = "cuda"  # 假設 control_tool 內部會把向量轉到 cuda
+
+        # fixed intensity for color test
+        color_intensity = 1.0
+        first_save = True
+
+        for cname, rgb in TEST_COLOR_LIST:
+            data = _prepare_batch_data(
+                ctx, item, args, int(img_id),
+                override_color=rgb,
+                override_intensity=color_intensity
+            )
+            relit = _run_inference_internal(ctx, data, args, item)
+
+            # quality metrics (optional prints)
+            s_score = _calculate_ssim(relit, data["ori_pil"])
+            n_score = _calculate_niqe(relit)
+            b_score = _calculate_brisque(relit)
+            l_score = _calculate_lpips(relit, data["ori_pil"])
+            
+            ca_single = control_tool.ca_directional_deltaY_roi(
+                data["ori_pil"],
+                relit,
+                rgb,      # target RGB in 0..255
+                q=92
+            )
+            
+            if first_save:
+                prefix = os.path.join(subdir, "roi")
+                control_tool.save_ca_roi_mask(
+                    data["ori_pil"],
+                    relit,
+                    prefix,
+                    q=92
+                )
+                first_save = False
+
+            ca_all.append(ca_single)
+            ca_by_color[cname].append(ca_single)
+
+            relit.save(os.path.join(subdir, f"color_{cname}.png"))
+            data["target_pil"].save(os.path.join(subdir, f"color_{cname}_pseudoGT.png"))
+            print(f"[CustomTest-Color] img_id={img_id} | {cname:8} "
+                  f"| SSIM:{s_score:.4f} NIQE:{n_score:.4f} BRISQUE:{b_score:.4f} LPIPS:{l_score:.4f} | CA:{ca_single:.4f}")
+
+        # ---------- Intensity metric (Δluma curve) ----------
+        # For this part: color fixed to white, sweep intensities
+        luma_vals = []
+        for alpha in TEST_INTENSITY_LIST:
+            data_i = _prepare_batch_data(
+                ctx, item, args, int(img_id),
+                override_color=WHITE,
+                override_intensity=float(alpha)
+            )
+            relit_i = _run_inference_internal(ctx, data_i, args, item)
+
+            # mean luma (global)
+            img_t = transforms.ToTensor()(relit_i).to("cuda")
+            luma_map = (img_t * luma_v_3d).sum(dim=0)
+            luma_vals.append(float(luma_map.mean().item()))
+
+            relit_i.save(os.path.join(subdir, f"intensity_white_{alpha:.2f}.png"))
+            data_i["target_pil"].save(os.path.join(subdir, f"intensity_{alpha:.2f}_pseudoGT.png"))
+
+        # Δluma per-image: subtract luma at 0.0
+        base = luma_vals[0]
+        delta_vals = [v - base for v in luma_vals]
+        delta_luma_all.append(delta_vals)
+
+        print(f"[CustomTest-Intensity] img_id={img_id} | "
+              f"Δluma={['{:.4f}'.format(x) for x in delta_vals]}")
+
+    # =========
+    # Aggregate & Plot (ALL images mean)
+    # =========
+    delta_luma_all = np.array(delta_luma_all, dtype=np.float64)  # (N, K)
+    mean_delta = delta_luma_all.mean(axis=0)
+    # 95% CI
+    if delta_luma_all.shape[0] > 1:
+        se = delta_luma_all.std(axis=0, ddof=1) / np.sqrt(delta_luma_all.shape[0])
+        ci95 = 1.96 * se
+    else:
+        ci95 = np.zeros_like(mean_delta)
+
+    # --- plot: mean + 95% CI band + individual curves ---
+    plt.figure(figsize=(7, 5))
+
+    # # 1) plot per-image curves (thin, transparent)
+    # for i in range(delta_luma_all.shape[0]):
+    #     plt.plot(
+    #         TEST_INTENSITY_LIST,
+    #         delta_luma_all[i],
+    #         linewidth=1.0,
+    #         alpha=0.20
+    #     )
+
+    # 2) plot mean curve (thicker)
+    plt.plot(
+        TEST_INTENSITY_LIST,
+        mean_delta,
+        marker="o",
+        color="deepskyblue",
+        linewidth=2.5
+    )
+
+    # 3) 95% CI as shaded band (instead of errorbars)
+    lower = mean_delta - ci95
+    upper = mean_delta + ci95
+    plt.fill_between(TEST_INTENSITY_LIST, lower, upper, alpha=0.20)
+
+    plt.xlabel("Condition intensity (alpha)")
+    plt.ylabel("Mean Δluma relative to alpha=0.0")
+    plt.title(f"Δluma Response")
+    plt.grid(True, alpha=0.3)
+
+    plot_path = os.path.join(out_dir, "intensity_delta_luma_mean_curve.png")
+    plt.savefig(plot_path, dpi=250, bbox_inches="tight")
+    plt.close()
+
+    # =========
+    # Summary numbers
+    # =========
+    mean_ca_all = float(np.mean(ca_all)) if len(ca_all) else 0.0
+    mean_ca_by_color = {k: (float(np.mean(v)) if len(v) else 0.0) for k, v in ca_by_color.items()}
+    
+    # ==============================
+    # Plot CA per color (Bar Chart)
+    # ==============================
+
+    color_names = [name for name, _ in TEST_COLOR_LIST]
+    mean_values = [mean_ca_by_color[name] for name in color_names]
+
+    # 轉成 matplotlib 可用的 RGB (0~1)
+    bar_colors = []
+    for _, rgb in TEST_COLOR_LIST:
+        bar_colors.append([c / 255.0 for c in rgb])
+
+    plt.figure(figsize=(7, 5))
+    bars = plt.bar(color_names, mean_values, color=bar_colors)
+
+    plt.ylim(0, 1.0)
+    plt.ylabel("Mean CA (Cosine Similarity)")
+    plt.title("Color Accuracy per Target Color")
+    plt.grid(axis="y", alpha=0.3)
+
+    # 在 bar 上顯示數值
+    for i, v in enumerate(mean_values):
+        plt.text(i, v + 0.02, f"{v:.3f}", ha="center")
+
+    bar_plot_path = os.path.join(out_dir, "ca_per_color_bar.png")
+    plt.tight_layout()
+    plt.savefig(bar_plot_path, dpi=250)
+    plt.close()
+
+    print(f"📊 CA per color bar chart saved to: {bar_plot_path}")
+
+    print("\n" + "=" * 60)
+    print("[CustomTest Summary] (Averaged over all test images)")
+    print(f"  Mean CA (all colors): {mean_ca_all:.4f}")
+    for cname in [n for n, _ in TEST_COLOR_LIST]:
+        print(f"  Mean CA ({cname}): {mean_ca_by_color[cname]:.4f}")
+    print(f"  Mean Δluma curve saved to: {plot_path}")
+    print("=" * 60)
+
+    # save txt summary
+    txt_path = os.path.join(out_dir, "custom_test_summary.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("Custom Test Summary\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Version: {args.version}\n")
+        f.write(f"Guidance Scale: {args.guidance_scale}\n")
+        f.write(f"Num images: {len(image_ids)}\n\n")
+
+        f.write("[Color Metric]\n")
+        f.write(f"Mean CA (all colors): {mean_ca_all:.6f}\n")
+        for cname in [n for n, _ in TEST_COLOR_LIST]:
+            f.write(f"Mean CA ({cname}): {mean_ca_by_color[cname]:.6f}\n")
+
+        f.write("\n[Intensity Metric]\n")
+        f.write("Intensity list: " + ",".join([str(a) for a in TEST_INTENSITY_LIST]) + "\n")
+        f.write("Mean Δluma: " + ",".join([f"{x:.6f}" for x in mean_delta]) + "\n")
+        f.write("95% CI: " + ",".join([f"{x:.6f}" for x in ci95]) + "\n")
+        f.write(f"Plot: {plot_path}\n")
+        f.write("=" * 60 + "\n")
+
+    print(f"Saved to: {out_dir}")
+    print(f"✅ Summary saved: {txt_path}")
 
 # ==========================================
 # Helper Functions
@@ -895,6 +1451,15 @@ def _set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     return torch.manual_seed(seed)
 
+def _calculate_psnr(img1, img2):
+    target_size = (512, 512)
+    # 確保兩者都是 PIL 且轉為 RGB
+    im1 = np.array(img1.convert("RGB").resize(target_size, Image.BILINEAR)).astype(np.float64)
+    im2 = np.array(img2.convert("RGB").resize(target_size, Image.BILINEAR)).astype(np.float64)
+    mse = np.mean((im1 - im2) ** 2)
+    if mse == 0: return 100.0
+    return 20 * np.log10(255.0 / np.sqrt(mse))
+    
 def _calculate_ssim(img1, img2):
     if img1.size != img2.size:
         img2 = img2.resize(img1.size, Image.BILINEAR)
@@ -933,13 +1498,29 @@ def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_inte
     [Update] 加入靜音邏輯：只有在 single 模式下才儲存 debug 圖。
     """
     ori = item['image']
+    # Auto Exposure: 當圖片太暗的時候自動提升亮度，讓 albedo estimator 有更好的輸入（這對於某些特別暗的圖很重要）
+    if getattr(args, "auto_exposure", True):
+        thr = float(getattr(args, "auto_exposure_thr", 0.25))
+        target = float(getattr(args, "auto_exposure_target", 0.35))
+        max_gain = float(getattr(args, "auto_exposure_max_gain", 4.0))
+        ori, ae_gain, ae_mean_l = _auto_exposure_pil(ori, thr=thr, target=target, max_gain=max_gain)
+        if getattr(args, "task", "") == "single":
+            print(f"[AutoExposure] img={idx} mean_luma={ae_mean_l:.3f} gain={ae_gain:.2f}")
+            
     normal = item['normal']
     depth = item['depth'].convert('L')
     
     if args.mode == 'lightlab' and 'mask_path' in item:
-         mask = Image.open(item['mask_path']).convert('L')
+        mask = Image.open(item['mask_path']).convert('L')
+    elif args.task == 'custom_test':
+        mask_path = f"/mnt/HDD3/miayan/paper/relighting_datasets/lsun/{idx}_mask.png"
+        if os.path.exists(mask_path):
+            print(f"Loading mask from {mask_path}")
+            mask = Image.open(mask_path).convert('L')
+        else:
+            mask = item['mask'].convert('L')
     else:
-         mask = item['mask'].convert('L')
+        mask = item['mask'].convert('L')
 
     # 設定 Parameters (支援 Override)
     if override_intensity is not None:
@@ -951,7 +1532,7 @@ def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_inte
         # override_color 預期是 list/tuple [R,G,B] 0-255
         color = torch.tensor([c/255.0 for c in override_color], dtype=torch.float32)
     else:
-        color = torch.tensor([0, 1.0, 0], dtype=torch.float32) # Default Green
+        color = torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32) # Default White
 
     manual_ambient = 0.75
 
@@ -966,7 +1547,8 @@ def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_inte
     # -----------------------------------------------------
     # [VISUALIZATION] 靜音邏輯：只有在 single 模式下才存圖
     # -----------------------------------------------------
-    should_save_debug = (args.task == 'single')
+    # should_save_debug = (args.task == 'single')
+    should_save_debug = False
 
     lightmap_rgb = None
     res_h = ctx['resolution']
@@ -1000,7 +1582,7 @@ def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_inte
     target_pil = res['image'] 
 
     # Albedo Estimation Debug
-    if ctx['albedo_wrapper']:
+    if ctx['albedo_wrapper'] and not args.use_pretrained_alb:
         with torch.no_grad():
             ori_t = ctx['img_transform'](ori).unsqueeze(0).to('cuda')
             pred_alb = ctx['albedo_wrapper'](ori_t)
@@ -1040,10 +1622,101 @@ def _prepare_batch_data(ctx, item, args, idx, override_color=None, override_inte
         "intensity": torch.tensor([intensity]).float().unsqueeze(0),
         "color": color.float().unsqueeze(0),
         "ambient": torch.tensor([ambient_val]).float().unsqueeze(0),
-        "controlnet_cond": cn_cond
+        "controlnet_cond": cn_cond,
+        "mask": mask,
+    }
+     
+def _prepare_bigtime_data(ctx, item, args, gt_config):
+    ori = item['image'].convert('RGB')
+    # Auto Exposure: 當圖片太暗的時候自動提升亮度，讓 albedo estimator 有更好的輸入（這對於某些特別暗的圖很重要）
+    if getattr(args, "auto_exposure", True):
+        thr = float(getattr(args, "auto_exposure_thr", 0.25))
+        target = float(getattr(args, "auto_exposure_target", 0.5))
+        max_gain = float(getattr(args, "auto_exposure_max_gain", 4.0))
+        ori, ae_gain, ae_mean_l = _auto_exposure_pil(ori, thr=thr, target=target, max_gain=max_gain)
+        if ae_gain > 1.0:
+            ori.save(f"./inference/{args.version}/bigtime_0100_autoexp/debug_autoexposure_ori_{gt_config['input_id']}.png")
+        if getattr(args, "task", "") == "single":
+            print(f"[AutoExposure] img={idx} mean_luma={ae_mean_l:.3f} gain={ae_gain:.2f}")
+                
+    normal = item['normal']
+    depth = item['depth'].convert('L')
+    mask = item['mask'].convert('L')
+    gt_image = item[gt_config['gt_col']].convert('RGB')
+    
+    intensity = gt_config.get('gt_intensity', 1.0)
+    color = torch.tensor(gt_config.get('gt_color', [255, 255, 255]), dtype=torch.float32)/255.0
+    manual_ambient = gt_config.get('gt_amb', 0.75)
+    
+    # -----------------------------------------------------
+    # Compute Relighting (Physics API)
+    # -----------------------------------------------------
+    cfg_cls = ctx['api'].PhysicalRelightingConfig
+    compute_fn = ctx['api'].compute_relighting
+    
+    p_cfg = cfg_cls(ori, normal, depth)
+    p_cfg.add_mask(mask, color, intensity)
+    res = compute_fn(p_cfg, manual_ambient)
+    pseudo_gt = res['image'].convert('RGB')
+    pseudo_gt.save(f"./inference/{args.version}/bigtime_0100_autoexp/debug_relighting_result_{gt_config['input_id']}.png")
+    
+    lightmap_rgb = None
+    res_h = ctx['resolution']
+    
+    if ctx['returns_ambient']:
+        ambient_val = res['ambient']
+        lightmap_rgb = res['lightmap_rgb']
+    else:
+        ambient_val = getattr(p_cfg, 'ambient', 0.75)
+        
+    if ctx['use_color_on_lightmap']:
+         # Ex14+ (黑底彩色)，優先抓 raw_rgb
+        if 'lightmap_raw_rgb' in res:
+             lightmap = res['lightmap_raw_rgb'].convert('RGB')
+        elif 'lightmap_rgb' in res:
+             lightmap = res['lightmap_rgb'].convert('RGB')
+        else:
+             lightmap = res['lightmap'].convert('RGB')
+    else:
+        # Ex10_1 (黑底黑白) 或 Ex8_10 (灰底黑白)
+        lightmap = res['lightmap'].convert('RGB')
+    
+    # -----------------------------------------------------
+    # Albedo Estimation
+    # -----------------------------------------------------
+    if ctx['albedo_wrapper'] and not args.use_pretrained_alb:
+        with torch.no_grad():
+            ori_t = ctx['img_transform'](ori).unsqueeze(0).to('cuda')
+            pred_alb = ctx['albedo_wrapper'](ori_t)
+            albedo_t = torch.clamp((pred_alb.cpu() * 2.0) - 1.0, -1.0, 1.0)
+    else:
+        albedo_t = ctx['img_transform'](item['albedo']).unsqueeze(0)
+        
+    # Condition Tensors
+    norm_t = ctx['cond_transform'](normal)
+    dep_t = ctx['cond_transform'](depth)
+    mask_t = ctx['cond_transform'](mask)
+    map_t = ctx['cond_transform'](lightmap)
+    
+    # ControlNet Condition Packing
+    if args.version in ctx['COND_CONFIG']['lightmap']:
+        cn_cond = (norm_t, map_t)
+    else:
+        dm = dep_t * mask_t
+        cn_cond = (norm_t, dep_t, mask_t, dm)
+
+    return {
+        "ori_pil": ori,
+        "target_pil": pseudo_gt,
+        "albedo": albedo_t,
+        "intensity": torch.tensor([intensity]).float().unsqueeze(0),
+        "color": color.float().unsqueeze(0),
+        "ambient": torch.tensor([ambient_val]).float().unsqueeze(0),
+        "controlnet_cond": cn_cond,
+        "gt_image": gt_image
     }
     
-def _run_inference_internal(ctx, data, args, item):
+def _run_inference_internal(ctx, data, args, item=None):
     """ 內部 Helper: 負責準備 Latents 並呼叫 Pipeline """
     albedo_latents = ctx['vae'].encode(data['albedo'].to(dtype=torch.float32).cuda()).latent_dist.sample() * ctx['vae'].config.scaling_factor
     albedo_noise = torch.randn_like(albedo_latents)
@@ -1058,7 +1731,7 @@ def _run_inference_internal(ctx, data, args, item):
         "generator": generator,
         "image": data['controlnet_cond'],
         "albedo_latents": albedo_latents_noisy.cuda(),
-        "prompt": item['prompt'] if args.version in ctx['COND_CONFIG']['prompt'] else None,
+        "prompt": item['prompt'] if args.version in ctx['COND_CONFIG']['prompt'] and item is not None else None,
     }
     if ctx['use_ambient_cond']:
         pipe_kwargs["ambient"] = data['ambient']
@@ -1078,23 +1751,84 @@ def _lab_target_ab_from_rgb(color_rgb, device):
     target_ab = torch.tensor(target_lab[0, 0, 1:3], dtype=torch.float32, device=device)
     return target_ab
 
+def _auto_exposure_pil(img_pil, thr=0.25, target=0.5, max_gain=6.0):
+    arr = np.asarray(img_pil.convert("RGB")).astype(np.float32) / 255.0
+    luma = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
+
+    # ⭐ 用 median 而不是 mean
+    median_l = float(np.percentile(luma, 50))
+
+    if median_l >= thr:
+        return img_pil, 1.0, median_l
+
+    gain = min(max_gain, target / (median_l + 1e-8))
+
+    arr2 = np.clip(arr * gain, 0.0, 1.0)
+    out = Image.fromarray((arr2 * 255.0).round().astype(np.uint8))
+    return out, float(gain), median_l
+
+def save_inference_visuals(out_dir, suffix, input_pil, output_pil, target_pil, mask_pil=None):
+
+    imgs = [
+        ("Input", input_pil),
+        ("Output", output_pil),
+        ("Target", target_pil),
+    ]
+
+    if mask_pil is not None:
+        imgs.append(("Mask", mask_pil))
+
+    # 統一尺寸
+    w, h = output_pil.size
+    imgs = [(name, img.resize((w, h))) for name, img in imgs]
+
+    title_h = 30
+    canvas = Image.new("RGB", (w * len(imgs), h + title_h), (255, 255, 255))
+
+    draw = ImageDraw.Draw(canvas)
+
+    try:
+        font = ImageFont.truetype("arial.ttf", 18)
+    except:
+        font = ImageFont.load_default()
+
+    for i, (name, img) in enumerate(imgs):
+
+        x = i * w
+
+        canvas.paste(img.convert("RGB"), (x, title_h))
+
+        # 畫文字
+        bbox = draw.textbbox((0,0), name, font=font)
+        tw = bbox[2] - bbox[0]
+        draw.text((x + w//2 - tw//2, 5), name, fill=(0,0,0), font=font)
+
+    canvas.save(f"{out_dir}/compare_{suffix}.png")
+
 # ==========================================
 # Main Entry Point
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-ver', '--version', type=str, required=True, help="Experiment version (e.g., train_ex8)")
-    parser.add_argument('-mode', '--mode', type=str, default='standard', choices=['standard', 'lightlab'])
+    parser.add_argument('-mode', '--mode', type=str, default='standard', choices=['standard', 'lightlab', 'bigtime'])
     
     # [修改] 選項：multicond (多顏色/強度), benchmark (Top 1%), single (單張)
     parser.add_argument('-task', '--task', type=str, default='single', 
-                        choices=['single', 'multicond', 'benchmark'], 
-                        help="'single': runs 1 image. 'multicond': sweeps colors/intensities. 'benchmark': saves top 1% dataset.")
+                        choices=['single', 'multicond', 'benchmark', 'custom_test'], 
+                        help="'single': runs 1 image. 'multicond': sweeps colors/intensities. 'benchmark': saves top 1% dataset. 'custom_test': runs specific image IDs with fixed color list.")
     
     parser.add_argument('-data', '--data', type=int, default=3, help="Number of data items to process")
+    parser.add_argument('-data_start', '--data_start', type=int, default=0, help="Starting index of data items to process")
     parser.add_argument('-seed', '--seed', type=int, default=6071)
     parser.add_argument('-pp', '--print_process', action='store_true')
     parser.add_argument('-gs', '--guidance_scale', type=float, default=0.0, help="SSIM Guidance Scale")
+    
+    # [新增] Auto Exposure 選項
+    parser.add_argument('--auto_exposure', action='store_true')
+    parser.add_argument("--auto_exposure_thr", type=float, default=0.25, help="Auto exposure threshold for mean luma (0-1)")
+    parser.add_argument("--auto_exposure_target", type=float, default=0.35, help="Auto exposure target mean luma (0-1)")
+    parser.add_argument("--auto_exposure_max_gain", type=float, default=4.0, help="Auto exposure max gain limit")
     
     # [新增] Benchmark 模式專用選項
     # Phase1
@@ -1112,6 +1846,13 @@ if __name__ == "__main__":
     parser.add_argument("--control_intensity_sweep", type=str, default="0.0,0.2,0.5,0.8,1.0")
     parser.add_argument("--phase2_intensity_csv", type=str, default="phase2_intensity_per_image.csv")
     parser.add_argument("--phase2_intensity_curve_csv", type=str, default="phase2_intensity_curve.csv")
+    
+    # [新增] BigTime 模式專用選項
+    parser.add_argument('--use_pretrained_alb', action='store_true')
+    
+    # [新增] Custom Test 模式專用選項
+    parser.add_argument("--test_ids", type=str, default="23,24,26,29,46,59,73,81")
+    # parser.add_argument("--test_ids", type=str, default="66,202725,218817,186980,125466,52308,69843,133576,67014,88258,209463,5,8,48,39")
 
     # optional HF upload
     parser.add_argument("--push_to_hub", action="store_true")
@@ -1124,6 +1865,7 @@ if __name__ == "__main__":
     # 2. Load Dataset
     repo = "Miayan/physical-relighting-dataset"
     if args.mode == 'lightlab': repo = "Miayan/physical-relighting-eval-dataset"
+    elif args.mode =='bigtime': repo = "Miayan/test-bigtime"
     
     print(f"Loading Dataset: {repo}")
     ds = load_dataset(repo, split="train", cache_dir="/mnt/HDD3/miayan/paper/relighting_datasets/")
@@ -1134,7 +1876,8 @@ if __name__ == "__main__":
             
     # Determine indices
     if args.mode == 'lightlab':
-        ids = [181, 16, 75, 77] 
+        ids = [181, 13, 75, 77] 
+        # ids = [181, 13, 75, 77, 8, 95] 
         mask_paths = [
             '/mnt/HDD3/miayan/paper/scriblit/eval_data/images_flatten/mask/0_0.png',
             '/mnt/HDD3/miayan/paper/scriblit/eval_data/images_flatten/mask/1_0.png',
@@ -1150,10 +1893,36 @@ if __name__ == "__main__":
             mapped_dataset.append(item)
         indices = range(len(mapped_dataset)) 
         dataset_to_use = mapped_dataset
+    elif args.mode == 'bigtime':
+        print("BigTime mode: Using all data without sampling.")
+        
+        GT_CONFIGS = [
+            {"input_id": 0, "gt_col": "gt_0001", "gt_color": [255, 255, 255], "gt_intensity": 1.0, "gt_amb": 0.25},
+            {"input_id": 0, "gt_col": "gt_0002", "gt_color": [255, 255, 255], "gt_intensity": 0.7, "gt_amb": 0.25},
+            {"input_id": 0, "gt_col": "gt_0003", "gt_color": [255, 255, 255], "gt_intensity": 0.2, "gt_amb": 0.1},
+            {"input_id": 1, "gt_col": "gt_0001", "gt_color": [195, 187, 74], "gt_intensity": 3.0, "gt_amb": 0.5},
+            {"input_id": 2, "gt_col": "gt_0001", "gt_color": [0, 133, 200], "gt_intensity": 3.0, "gt_amb": 0.6},
+            {"input_id": 2, "gt_col": "gt_0002", "gt_color": [255, 255, 0], "gt_intensity": 1.0, "gt_amb": 0.6},
+            {"input_id": 3, "gt_col": "gt_0001", "gt_color": [255, 255, 255], "gt_intensity": 1.0, "gt_amb": 0.75},
+            {"input_id": 4, "gt_col": "gt_0001", "gt_color": [255, 255, 255], "gt_intensity": 1.5, "gt_amb": 0.75},
+            {"input_id": 4, "gt_col": "gt_0002", "gt_color": [255, 255, 255], "gt_intensity": 0.5, "gt_amb": 0.5},
+            {"input_id": 5, "gt_col": "gt_0001", "gt_color": [255, 255, 255], "gt_intensity": 0.5, "gt_amb": 0.5},
+            {"input_id": 5, "gt_col": "gt_0002", "gt_color": [255, 255, 255], "gt_intensity": 1.0, "gt_amb": 0.75},
+            {"input_id": 6, "gt_col": "gt_0001", "gt_color": [255, 255, 0], "gt_intensity": 3.0, "gt_amb": 0.75},
+            {"input_id": 7, "gt_col": "gt_0001", "gt_color": [248, 132, 52], "gt_intensity": 1.0, "gt_amb": 0.75},
+            {"input_id": 7, "gt_col": "gt_0002", "gt_color": [248, 132, 52], "gt_intensity": 2.0, "gt_amb": 0.75},
+            {"input_id": 8, "gt_col": "gt_0001", "gt_color": [255, 0, 255], "gt_intensity": 1.0, "gt_amb": 0.75},
+            {"input_id": 9, "gt_col": "gt_0001", "gt_color": [0, 255, 255], "gt_intensity": 1.0, "gt_amb": 0.75},
+            {"input_id": 10, "gt_col": "gt_0001", "gt_color": [255, 0, 255], "gt_intensity": 1.0, "gt_amb": 0.75},
+        ]
+        
+        dataset_to_use = ds
+        total_len = len(ds)
+        run_bigtime_test(ctx, args, dataset_to_use, GT_CONFIGS[:args.data])
     else:
+        total_len = len(ds)
         # Standard mode indices
         if args.task == 'benchmark':
-            total_len = len(ds)
             sample_size = min(args.data, total_len)
 
             print(f"[Benchmark] Randomly sampling {sample_size} images from {total_len}")
@@ -1163,15 +1932,24 @@ if __name__ == "__main__":
             random.seed(args.seed)
 
             indices = random.sample(range(total_len), sample_size)
+        elif args.task == 'single' and args.mode == 'standard':
+            indices = range(args.data_start, min(args.data, total_len))
         else:
-            indices = range(args.data)
+            sample_size = min(args.data, total_len)
+            indices = range(sample_size)
         dataset_to_use = ds
 
     # 3. Dispatch Task
-    if args.task == 'single':
-        run_single_inference(ctx, args, dataset_to_use, indices)
-    elif args.task == 'multicond':
-        # [New] Color/Intensity Sweep
-        run_multicond_sweep(ctx, args, dataset_to_use, indices)
-    elif args.task == 'benchmark':
-        run_benchmark_three_phase(ctx, args, dataset_to_use, indices)
+    if args.mode != 'bigtime':
+        if args.task == 'single':
+            run_single_inference(ctx, args, dataset_to_use, indices)
+        elif args.task == 'multicond':
+            # [New] Color/Intensity Sweep
+            run_multicond_sweep(ctx, args, dataset_to_use, indices)
+        elif args.task == 'benchmark':
+            run_benchmark_three_phase(ctx, args, dataset_to_use, indices)
+        elif args.task == 'custom_test':
+            if not args.test_ids.strip():
+                raise ValueError("custom_test requires --test_ids 12,34,56")
+            image_ids = [int(x.strip()) for x in args.test_ids.split(",") if x.strip()]
+            run_custom_id_color_test(ctx, args, dataset_to_use, image_ids)

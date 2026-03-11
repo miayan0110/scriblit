@@ -13,6 +13,7 @@ train_ex*/*
 *.lock
 *.csv
 *.arrow
+*.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
