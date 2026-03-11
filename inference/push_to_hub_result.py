@@ -59,7 +59,7 @@ def upload_selected_experiments(root_dir, experiment_list, repo_id, token=None):
 if __name__ == "__main__":
     # 建議先在終端機執行 export HF_TOKEN=你的Token
     # 或者直接在這裡填入字串
-    # MY_TOKEN = "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"
+    # MY_TOKEN = "xxx"
     
     ROOT_DIR = "/mnt/HDD3/miayan/paper/scriblit/inference"
     # 你想要上傳的實驗清單
